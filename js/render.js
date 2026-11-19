@@ -16,10 +16,8 @@ const SPRITE_NAMES = [
     'ship_a', 'ship_b', 'stone_a', 'stone_b', 'stone_c', 'stone_cracked', 'stone_debris_a', 'stone_debris_b',
     'metal_a', 'metal_b', 'metal_c', 'ice_a', 'ice_b', 'ice_shards',
     'laser_a', 'laser_b', 'spark_a', 'spark_b', 'explosion', 'smoke',
+    'explosive', 'explosive_cracking', 'explosive_burst', 'ship_hit', 'ship_breaking', 'ship_wreck',
 ];
-
-// Sprites that may not have real art yet: use <name>.png if present, else <name>_placeholder.png.
-const OPTIONAL_SPRITES = ['explosive'];
 
 function loadImage(src) {
     return new Promise(resolve => {
@@ -36,12 +34,11 @@ async function loadSprites() {
         sprites[name] = await loadImage(`assets/sprites/${name}.png`);
         if (!sprites[name]) console.warn(`sprite ${name} failed to load`);
     }));
-    await Promise.all(OPTIONAL_SPRITES.map(async name => {
-        sprites[name] = await loadImage(`assets/sprites/${name}.png`)
-            || await loadImage(`assets/sprites/${name}_placeholder.png`);
-    }));
     return sprites;
 }
+
+// The destruction frames show the ship banked up-right; rotate them to match the upright ship.
+const WRECK_ROTATION = -Math.PI / 4;
 
 class Renderer {
     constructor(canvas, sprites) {
@@ -76,6 +73,7 @@ class Renderer {
         this.effects = [];
         this.ship = { x: laneX(START_LANE), tilt: 0 };
         this.shipVisible = true;
+        this.hideShipAt = 0;
     }
 
     /** Called after every tick with the world's events. */
@@ -101,21 +99,36 @@ class Renderer {
                     this.addEffect(e.type === 'ice' ? 'ice_shards' : 'stone_debris_b', x, y, 105, 450, { grow: 0.5 });
                     this.addEffect('spark_b', x, y + 20, 70, 220);
                     break;
-                case 'detonate':
-                    this.addEffect('explosion', x, y, 190, 700, { grow: 0.4 });
-                    this.addEffect('smoke', x, y, 200, 1500, { delay: 400, grow: 0.3 });
+                case 'detonate': {
+                    // The rock cracks open, bursts, then the blast.
+                    const at = v ? v.y : y;
+                    this.addEffect('explosive_cracking', x, at, 92, 130, { fade: false });
+                    this.addEffect('explosive_burst', x, at, 96, 170, { delay: 130, fade: false });
+                    this.addEffect('explosion', x, at, 200, 700, { delay: 280, grow: 0.4 });
+                    this.addEffect('smoke', x, at, 210, 1500, { delay: 650, grow: 0.3 });
                     break;
-                case 'crash':
-                    this.addEffect('explosion', this.ship.x, rowY(PLAYER_ROW), 150, 650, { grow: 0.3 });
-                    this.addEffect('smoke', this.ship.x, rowY(PLAYER_ROW), 170, 1600, { delay: 450, grow: 0.25 });
-                    this.shipVisible = false;
+                }
+                case 'crash': {
+                    // Ship destruction: hit -> breaking apart -> drifting wreck, with an explosion on top.
+                    const sx = this.ship.x, sy = rowY(PLAYER_ROW);
+                    const delay = e.cause === 'detonated' ? 260 : 0; // wait for the shockwave
+                    const spin = { rotation: WRECK_ROTATION + this.ship.tilt, fade: false };
+                    this.addEffect('ship_hit', sx, sy, 125, 160, { ...spin, delay });
+                    this.addEffect('ship_breaking', sx, sy, 125, 260, { ...spin, delay: delay + 160 });
+                    this.addEffect('explosion', sx, sy, 150, 650, { delay: delay + 220, grow: 0.3 });
+                    this.addEffect('ship_wreck', sx, sy, 125, 1900, { rotation: WRECK_ROTATION, delay: delay + 420, vy: 22 });
+                    this.addEffect('smoke', sx, sy, 170, 1600, { delay: delay + 650, grow: 0.25 });
+                    if (delay) this.hideShipAt = performance.now() + delay;
+                    else this.shipVisible = false;
                     break;
+                }
             }
         }
     }
 
-    addEffect(sprite, x, y, size, duration, { delay = 0, grow = 0 } = {}) {
-        this.effects.push({ sprite, x, y, size, duration, grow, start: performance.now() + delay });
+    /** fade: fade out over the duration (off for animation frames). vy: drift in px/s. */
+    addEffect(sprite, x, y, size, duration, { delay = 0, grow = 0, rotation = 0, fade = true, vy = 0 } = {}) {
+        this.effects.push({ sprite, x, y, size, duration, grow, rotation, fade, vy, start: performance.now() + delay });
     }
 
     drawSprite(name, x, y, size, rotation = 0, alpha = 1) {
@@ -225,6 +238,7 @@ class Renderer {
         const dx = targetX - this.ship.x;
         this.ship.x += dx * Math.min(1, ease * 1.4);
         this.ship.tilt = Math.max(-0.35, Math.min(0.35, dx * 0.004));
+        if (this.hideShipAt && now >= this.hideShipAt) { this.shipVisible = false; this.hideShipAt = 0; }
         if (this.shipVisible) {
             const frame = Math.floor(now / 90) % 2 ? 'ship_a' : 'ship_b';
             const bob = Math.sin(now / 260) * 2;
@@ -236,7 +250,8 @@ class Renderer {
         for (const e of this.effects) {
             if (now < e.start) continue;
             const t = (now - e.start) / e.duration;
-            this.drawSprite(e.sprite, e.x, e.y, e.size * (1 + e.grow * t), 0, 1 - t * t);
+            const y = e.y + e.vy * (now - e.start) / 1000;
+            this.drawSprite(e.sprite, e.x, y, e.size * (1 + e.grow * t), e.rotation, e.fade ? 1 - t * t : 1);
         }
 
         this.drawHud(world, ui, now);

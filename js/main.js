@@ -115,7 +115,7 @@ function gameOver() {
         $('overlay-subtitle').textContent = `${cause} · score ${world.score} · ${world.destroyed} destroyed`;
         $('btn-start').textContent = 'Retry same field';
         $('overlay').classList.remove('hidden');
-    }, 900);
+    }, 1700); // let the destruction animation play first
     refreshUi();
 }
 

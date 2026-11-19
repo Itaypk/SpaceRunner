@@ -127,10 +127,8 @@ The honest counterpoint, in case someone raises it: a defensively written bot (u
 dodge) would have survived. A bot updated with the new rule plays well again, but someone had
 to change and ship code, while the model only needed a sentence. That trade-off is the point.
 
-**Sprite:** the explosive asteroid is currently a recoloured ice crystal
-(`assets/sprites/explosive_placeholder.png`). Drop a real `assets/sprites/explosive.png` next
-to it and the game uses that instead. A transparent PNG about 220 px on the long side matches
-the other sprites.
+When an explosive is shot, it cracks open and bursts before the blast reaches the ship, and
+the ship plays its own destruction sequence (hit → breaking apart → wreck).
 
 The **seed** sets the asteroid field. The same seed always produces the same asteroids,
 whoever is flying, so you can compare models (or a model against the bot) fairly. Finished
@@ -285,12 +283,16 @@ js/agents.js            heuristic bot, decision-model client, LLM client, defaul
 js/render.js            canvas renderer, sprites, effects
 js/main.js              tick loop, clock modes, UI
 assets/spritesheet.jpeg original sprite sheet
+assets/spritesheet2.webp explosive asteroid + ship destruction frames
 assets/sprites/*.png    sprites cut out of the sheet (transparent)
 tools/extract_sprites.py regenerates assets/sprites from the sheet
 ```
 
-To regenerate the sprites after editing the sheet: `pip install pillow numpy`, then
-`python3 tools/extract_sprites.py`. The crop boxes are listed at the top of the script.
+To regenerate the sprites after editing a sheet: `pip install pillow numpy`, then
+`python3 tools/extract_sprites.py`. Neither sheet has real transparency (one is on a navy
+grid, the other on a *painted* checkerboard), so the script floods the background out from
+each crop's border. The crop boxes are at the top of the script; a new sheet needs its own
+boxes and background test.
 
 ## Ideas not implemented (yet)
 
