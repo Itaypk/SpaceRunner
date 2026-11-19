@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Space Runner · decision model demo</title>
+    <!-- Fonts are optional; everything else is local so the demo works offline. -->
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@400;700&display=swap">
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<main class="layout">
+
+    <!-- Game -->
+    <section class="game-col">
+        <div class="stage">
+            <canvas id="game-canvas"></canvas>
+            <div id="overlay" class="overlay">
+                <h1 id="overlay-title">Space Runner</h1>
+                <p id="overlay-subtitle">Dodge metal. Shoot stone &amp; ice.</p>
+                <div class="row">
+                    <button id="btn-start" class="primary">Start</button>
+                    <button id="btn-new-field">New field</button>
+                </div>
+                <p class="keys-hint">Enter to start</p>
+            </div>
+        </div>
+        <div class="help">
+            <kbd>←</kbd><kbd>→</kbd> move · <kbd>Space</kbd> shoot · <kbd>↓</kbd> stay ·
+            <kbd>P</kbd> pause · <kbd>N</kbd> step · <kbd>R</kbd> restart · <kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> pilot
+        </div>
+    </section>
+
+    <!-- Controls -->
+    <section class="panel-col">
+        <div class="card">
+            <h2>Pilot</h2>
+            <div class="segmented">
+                <button data-controller="keyboard">Keyboard</button>
+                <button data-controller="bot">Heuristic bot</button>
+                <button data-controller="ollama">LLM (Ollama)</button>
+            </div>
+
+            <h2>Clock</h2>
+            <div class="segmented">
+                <button data-pacing="realtime">Real-time</button>
+                <button data-pacing="turn">Turn-based</button>
+            </div>
+            <p id="pacing-hint" class="hint"></p>
+            <label class="slider">
+                <input id="tick-ms" type="range" min="100" max="2000" step="50">
+                <span id="tick-ms-label"></span>
+            </label>
+            <div class="row">
+                <button id="btn-pause">Pause (P)</button>
+                <button id="btn-step">Step (N)</button>
+                <button id="btn-restart">Restart (R)</button>
+            </div>
+            <div class="row inline">
+                <label>Seed <input id="seed" type="number" min="0" class="narrow"></label>
+                <button id="btn-dice" title="Random seed">🎲</button>
+                <label class="check"><input id="show-overlay" type="checkbox"> Show rows_away</label>
+            </div>
+        </div>
+
+        <div id="ollama-panel" class="card">
+            <div class="card-head">
+                <h2>Ollama</h2>
+                <span id="ollama-status" class="status pending">…</span>
+            </div>
+            <label>Server <input id="base-url" type="text" spellcheck="false"></label>
+            <label>Model
+                <span class="row inline">
+                    <input id="model" type="text" list="model-list" placeholder="e.g. qwen3:8b" spellcheck="false">
+                    <button id="btn-refresh-models" title="Reload model list">↻</button>
+                    <button id="btn-warmup" title="Load the model into memory before the demo">Warm up</button>
+                </span>
+            </label>
+            <datalist id="model-list"></datalist>
+            <label class="slider">Temperature
+                <input id="temperature" type="range" min="0" max="1.5" step="0.1">
+                <span id="temperature-label" class="short"></span>
+            </label>
+            <label class="check"><input id="with-reasoning" type="checkbox"> Ask for a short reasoning (slower, but explainable)</label>
+            <label class="check"><input id="disable-thinking" type="checkbox"> Disable "thinking" for reasoning models</label>
+            <details>
+                <summary>System prompt</summary>
+                <textarea id="system-prompt" rows="14" spellcheck="false"></textarea>
+                <button id="btn-reset-prompt">Reset to default</button>
+            </details>
+            <div id="ollama-error" class="error hidden"></div>
+        </div>
+
+        <div class="card">
+            <h2>Stats (this run)</h2>
+            <div class="stats">
+                <div><span id="stat-decisions">0</span>decisions</div>
+                <div><span id="stat-avg">–</span>avg latency</div>
+                <div><span id="stat-p95">–</span>p95 latency</div>
+                <div><span id="stat-tps">–</span>tokens/s</div>
+                <div><span id="stat-invalid">0</span>invalid outputs</div>
+                <div><span id="stat-missed">0</span>ticks w/o decision</div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Inspector -->
+    <section class="panel-col wide">
+        <div class="card">
+            <div class="card-head">
+                <h2 id="obs-title">Current state</h2>
+                <span id="tick-counter" class="pill">Tick 0</span>
+            </div>
+            <pre id="state-json" class="code">{}</pre>
+        </div>
+
+        <div class="card">
+            <div class="card-head">
+                <h2>Model response</h2>
+                <span id="response-meta" class="pill">–</span>
+            </div>
+            <div class="decision">
+                <span id="response-action" class="action">–</span>
+                <span id="response-reasoning" class="reasoning"></span>
+            </div>
+            <pre id="response-thinking" class="code thinking hidden"></pre>
+            <details>
+                <summary>Raw output</summary>
+                <pre id="response-raw" class="code"></pre>
+            </details>
+        </div>
+
+        <div class="card grow">
+            <h2>Log</h2>
+            <div id="action-log" class="log"></div>
+        </div>
+
+        <div class="card">
+            <div class="card-head">
+                <h2>Runs</h2>
+                <button id="btn-clear-runs" class="small">Clear</button>
+            </div>
+            <table class="runs">
+                <thead><tr><th>Pilot</th><th>Clock</th><th>Seed</th><th>Score</th><th>Kills</th><th>Avg ms</th><th>Missed</th></tr></thead>
+                <tbody id="runs-body"></tbody>
+            </table>
+            <p id="runs-empty" class="hint">Finished games show up here, so you can compare pilots on the same seed.</p>
+        </div>
+    </section>
+</main>
+
+<script src="js/game.js"></script>
+<script src="js/agents.js"></script>
+<script src="js/render.js"></script>
+<script src="js/main.js"></script>
+</body>
+</html>
