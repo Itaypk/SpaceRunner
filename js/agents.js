@@ -1,7 +1,8 @@
 /**
  * Decision makers. Each one turns the current world into one of ACTIONS.
  *  - HeuristicBot: a small look-ahead search. A non-LLM baseline to compare against.
- *  - OllamaAgent: asks a local model served by Ollama, via its /api/chat endpoint.
+ *  - DecisionAgent: a decision model (e.g. nimble) via Ollama's /v1/systemone endpoint.
+ *  - LlmAgent: a general chat LLM via /api/chat. The "too slow for this" comparison.
  */
 
 class HeuristicBot {
@@ -65,16 +66,67 @@ Each turn you receive the current state as JSON: per lane, the nearest asteroids
 
 Survive as long as possible. Destroying asteroids is a bonus, surviving is what counts.`;
 
-class OllamaAgent {
+// Two variants, matching the two state formats (raw grid facts vs. pre-digested lane facts).
+const DEFAULT_DECISION_INSTRUCTIONS = {
+    raw: `The state describes a spaceship in a 4-lane asteroid field, seen from above. Lanes are numbered 0 (far left) to 3 (far right); the ship is in \`player_lane\`.
+Each entry in \`lanes\` lists that lane's nearest asteroids, closest first. \`rows_away\` is how many turns until the asteroid reaches the ship's row; asteroids move 1 row per turn.
+If an asteroid reaches the ship's row in the ship's lane, the ship is destroyed. Ice needs 1 laser hit, stone needs 2 (\`hits_left\`), metal cannot be destroyed and must be dodged.
+Changing lanes is only safe if the target lane has no asteroid at rows_away 0 or 1.
+Which action keeps the ship alive this turn and in the turns after it?`,
+    digested: `The state describes a spaceship flying through an asteroid field, seen from above.
+\`current_lane\` is the ship's lane: \`threat\` says what is coming ("none", "shootable" for ice/stone, "must_dodge" for metal) and \`turns_to_impact\` says how soon it hits the ship if the ship stays.
+\`left_lane\` and \`right_lane\` describe the neighbouring lanes: \`exists\` is false at the edge of the field, and \`safe_to_enter\` says whether moving there this turn is safe. Their \`threat\` and \`turns_to_impact\` describe what comes next in that lane.
+A metal asteroid can only be dodged. Ice and stone can be shot, but stone needs 2 hits (\`hits_left\`).
+Which action keeps the ship alive this turn and in the turns after it?`,
+};
+
+/**
+ * Pre-compute the facts a decision model would otherwise have to work out with arithmetic
+ * ("is rows_away <= 1?"), framed relative to the ship so they map onto the action options.
+ */
+function digestObservation(obs) {
+    const describe = lane => {
+        const info = obs.lanes[lane];
+        if (!info) return { exists: false };
+        const ahead = info.asteroids.filter(a => a.rows_away >= 1);
+        const nearest = ahead[0];
+        const out = {
+            exists: true,
+            threat: !nearest ? 'none' : nearest.type === 'metal' ? 'must_dodge' : 'shootable',
+        };
+        if (nearest) {
+            out.nearest = nearest.type;
+            out.turns_to_impact = nearest.rows_away;
+            if (nearest.hits_left) out.hits_left = nearest.hits_left;
+        }
+        if (info.lasers_in_flight) out.lasers_in_flight = info.lasers_in_flight;
+        return out;
+    };
+    const safeToEnter = lane => {
+        const info = obs.lanes[lane];
+        return !!info && !info.asteroids.some(a => a.rows_away <= 1);
+    };
+    const side = lane => {
+        const d = describe(lane);
+        return d.exists ? { exists: true, safe_to_enter: safeToEnter(lane), ...d } : d;
+    };
+    const lane = obs.player_lane;
+    return { turn: obs.turn, current_lane: describe(lane), left_lane: side(lane - 1), right_lane: side(lane + 1) };
+}
+
+// Option descriptions for the choice question. Order matters: ties go to the earlier option.
+const DEFAULT_DECISION_CRITERIA = {
+    STAY: 'Stay in the current lane and do nothing. Right when nothing in the ship\'s lane is about to arrive.',
+    SHOOT: 'Fire a laser up the current lane. Right when the nearest asteroid in the ship\'s lane is ice or stone.',
+    LEFT: 'Move one lane to the left (lane number - 1). Right when the current lane is threatened and the left lane is safe.',
+    RIGHT: 'Move one lane to the right (lane number + 1). Right when the current lane is threatened and the right lane is safe.',
+};
+
+/** Shared plumbing for talking to a local Ollama server. */
+class OllamaClient {
     constructor() {
-        this.name = 'Ollama';
         this.baseUrl = 'http://localhost:11434';
         this.model = '';
-        this.systemPrompt = DEFAULT_SYSTEM_PROMPT;
-        this.temperature = 0.2;
-        this.withReasoning = true;
-        this.disableThinking = true;
-        this.thinkUnsupported = false; // learned from the server's response
         this.controller = null;
     }
 
@@ -92,18 +144,134 @@ class OllamaAgent {
         return (data.models || []).map(m => m.name).sort();
     }
 
-    schema() {
-        const properties = { action: { type: 'string', enum: ACTIONS } };
-        const required = ['action'];
-        if (this.withReasoning) {
-            // Reasoning comes first so the model "thinks" before it commits to an action.
-            return {
-                type: 'object',
-                properties: { reasoning: { type: 'string' }, ...properties },
-                required: ['reasoning', ...required],
+    /** POST JSON; returns { data, latencyMs }. Throws OllamaError (with .status) or AbortError. */
+    async post(path, body) {
+        this.abort();
+        this.controller = new AbortController();
+        const started = performance.now();
+        let res;
+        try {
+            res = await fetch(this.url(path), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+                signal: this.controller.signal,
+            });
+        } catch (err) {
+            if (err.name === 'AbortError') throw err;
+            throw new OllamaError(
+                `Can't reach Ollama at ${this.baseUrl}. Is it running? If it is, it's probably CORS: ` +
+                `open the game from http://localhost (see README) or set OLLAMA_ORIGINS.`);
+        }
+        const text = await res.text();
+        let data = {};
+        try { data = JSON.parse(text); } catch (_) { data = { error: text.trim() }; }
+        if (!res.ok) throw new OllamaError(data.error || `HTTP ${res.status}`, res.status);
+        return { data, latencyMs: Math.round(performance.now() - started) };
+    }
+}
+
+class OllamaError extends Error {
+    constructor(message, status = 0) {
+        super(message);
+        this.status = status;
+    }
+}
+
+/**
+ * A decision model (e.g. nimble) through Ollama's decision endpoint, POST /v1/systemone.
+ * No text generation: the model scores the given options directly and returns a
+ * probability per option, which is why it's fast enough to act every tick.
+ */
+class DecisionAgent extends OllamaClient {
+    constructor() {
+        super();
+        this.name = 'Decision model';
+        this.model = 'nimble';
+        this.instructions = DEFAULT_DECISION_INSTRUCTIONS.digested;
+        this.criteria = DEFAULT_DECISION_CRITERIA;
+        this.digestState = true;
+        this.askDanger = false;
+    }
+
+    /** What actually goes into `state`. */
+    stateFor(observation) {
+        return this.digestState ? digestObservation(observation) : observation;
+    }
+
+    buildRequest(observation) {
+        const questions = {
+            action: { type: 'choice', instructions: this.instructions, criteria: this.criteria },
+        };
+        if (this.askDanger) {
+            // A second, independent yes/no question. Each question is scored separately, so it costs latency.
+            questions.danger = {
+                type: 'noul',
+                instructions: 'Will an asteroid in the ship\'s current lane reach the ship within the next 3 turns?',
             };
         }
-        return { type: 'object', properties, required };
+        return { model: this.model, state: this.stateFor(observation), questions, keep_alive: '30m' };
+    }
+
+    /** Returns { action, valid, probabilities, confidence, danger, raw, latencyMs, usage, request }. */
+    async decide(observation) {
+        const request = this.buildRequest(observation);
+        let result;
+        try {
+            result = await this.post('/v1/systemone', request);
+        } catch (err) {
+            if (err instanceof OllamaError) throw DecisionAgent.explain(err, this.model);
+            throw err;
+        }
+        const { data, latencyMs } = result;
+        const answer = (data.answers && data.answers.action) || {};
+        const valid = ACTIONS.includes(answer.choice);
+        return {
+            action: valid ? answer.choice : 'STAY',
+            valid,
+            probabilities: answer.probabilities || {},
+            confidence: answer.confidence,
+            danger: data.answers && data.answers.danger ? data.answers.danger.noul : undefined,
+            usage: data.usage,
+            raw: JSON.stringify(data, null, 2),
+            latencyMs,
+            request,
+        };
+    }
+
+    static explain(err, model) {
+        if (err.status === 404 && /model/i.test(err.message)) {
+            return new OllamaError(`Model "${model}" not found. Run: ollama pull ${model || 'nimble'}`, 404);
+        }
+        if (err.status === 404) {
+            return new OllamaError('This Ollama has no /v1/systemone endpoint. Decision models need Ollama v0.35.0 or newer.', 404);
+        }
+        if (err.status === 400) {
+            return new OllamaError(`Ollama rejected the request: ${err.message}. Is "${model}" a decision model (e.g. nimble)?`, 400);
+        }
+        return new OllamaError(`Ollama error: ${err.message}`, err.status);
+    }
+}
+
+/** A general chat LLM via /api/chat with structured output. Kept to show why it's too slow per tick. */
+class LlmAgent extends OllamaClient {
+    constructor() {
+        super();
+        this.name = 'LLM';
+        this.systemPrompt = DEFAULT_SYSTEM_PROMPT;
+        this.temperature = 0.2;
+        this.withReasoning = true;
+        this.disableThinking = true;
+        this.thinkUnsupported = false; // learned from the server's response
+    }
+
+    stateFor(observation) { return observation; }
+
+    schema() {
+        const action = { type: 'string', enum: ACTIONS };
+        if (!this.withReasoning) return { type: 'object', properties: { action }, required: ['action'] };
+        // Reasoning comes first so the model "thinks" before it commits to an action.
+        return { type: 'object', properties: { reasoning: { type: 'string' }, action }, required: ['reasoning', 'action'] };
     }
 
     buildRequest(observation) {
@@ -126,43 +294,24 @@ class OllamaAgent {
         return body;
     }
 
-    /**
-     * Returns { action, reasoning, thinking, raw, valid, latencyMs, tokensPerSec, loadMs, request }.
-     * Throws OllamaError for connection/server problems, AbortError if aborted.
-     */
+    /** Returns { action, reasoning, thinking, raw, valid, latencyMs, tokensPerSec, loadMs, request }. */
     async decide(observation) {
-        this.abort();
-        this.controller = new AbortController();
         const request = this.buildRequest(observation);
-        const started = performance.now();
-        let res;
+        let result;
         try {
-            res = await fetch(this.url('/api/chat'), {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(request),
-                signal: this.controller.signal,
-            });
+            result = await this.post('/api/chat', request);
         } catch (err) {
-            if (err.name === 'AbortError') throw err;
-            throw new OllamaError(
-                `Can't reach Ollama at ${this.baseUrl}. Is it running? If it is, it's probably CORS: ` +
-                `open the game from http://localhost (see README) or set OLLAMA_ORIGINS.`);
-        }
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-            const msg = data.error || `HTTP ${res.status}`;
-            if (request.think === false && /think/i.test(msg)) {
+            if (err instanceof OllamaError && request.think === false && /think/i.test(err.message)) {
                 this.thinkUnsupported = true; // older server or model without the option: retry once
                 return this.decide(observation);
             }
-            throw new OllamaError(`Ollama error: ${msg}`);
+            if (err instanceof OllamaError) throw new OllamaError(`Ollama error: ${err.message}`, err.status);
+            throw err;
         }
-        const latencyMs = Math.round(performance.now() - started);
+        const { data, latencyMs } = result;
         const raw = (data.message && data.message.content) || '';
-        const parsed = OllamaAgent.parse(raw);
         return {
-            ...parsed,
+            ...LlmAgent.parse(raw),
             raw,
             thinking: data.message && data.message.thinking,
             latencyMs,
@@ -185,5 +334,3 @@ class OllamaAgent {
         return { action: 'STAY', reasoning: '', valid: false };
     }
 }
-
-class OllamaError extends Error {}

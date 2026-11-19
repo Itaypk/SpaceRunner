@@ -1,5 +1,5 @@
 /**
- * Wires everything together: the tick loop, the three pilots (keyboard, bot, LLM),
+ * Wires everything together: the tick loop, the four pilots (keyboard, bot, decision model, LLM),
  * the clock modes (real-time / turn-based / paused + step) and the side panels.
  *
  * Clock semantics, which is the point of the demo:
@@ -18,6 +18,8 @@ const DEFAULT_SETTINGS = {
     controller: 'keyboard', pacing: 'realtime', tickMs: 350, seed: 1234, showOverlay: true,
     baseUrl: 'http://localhost:11434', model: '', temperature: 0.2,
     withReasoning: true, disableThinking: true, systemPrompt: DEFAULT_SYSTEM_PROMPT,
+    decisionModel: 'nimble', digestState: true, askDanger: false,
+    decisionInstructions: DEFAULT_DECISION_INSTRUCTIONS.digested,
 };
 const settings = { ...DEFAULT_SETTINGS, ...readStorage('spacerunner.settings', {}) };
 function readStorage(key, fallback) {
@@ -31,7 +33,13 @@ const saveSettings = () => writeStorage('spacerunner.settings', settings);
 // ---------- state ----------
 const $ = id => document.getElementById(id);
 const bot = new HeuristicBot();
-const ollama = new OllamaAgent();
+const llm = new LlmAgent();
+const decider = new DecisionAgent();
+/** The two pilots that call a model. 'ollama' is the chat LLM (name kept for saved settings). */
+const MODEL_PILOTS = {
+    decision: { agent: decider, actor: 'Decision', model: () => settings.decisionModel },
+    ollama: { agent: llm, actor: 'LLM', model: () => settings.model },
+};
 let renderer;
 let world = new World(settings.seed);
 let phase = 'menu';            // 'menu' | 'playing' | 'over'
@@ -41,7 +49,7 @@ let pendingKey = null;
 let runId = 0;
 let inflight = null;           // pending LLM request: { promise, forTick }
 let stats;
-const ui = { thinkingSince: 0, lastAction: null, lastActionAt: 0 };
+const ui = { thinkingSince: 0, lastAction: null, lastActionAt: 0, lastConfidence: null };
 let runs = readStorage('spacerunner.runs', []);
 
 /** Something changed (key, pause, step...): wake up whoever waits. */
@@ -60,7 +68,7 @@ function interruptAll() { for (const r of interrupts) r(INTERRUPTED); interrupts
 const sleep = ms => new Promise(r => setTimeout(r, Math.max(0, ms)));
 
 function resetStats() {
-    stats = { decisions: 0, latencies: [], invalid: 0, missed: 0, lastTps: null };
+    stats = { decisions: 0, latencies: [], invalid: 0, missed: 0, lastTps: null, confidences: [] };
 }
 
 // ---------- game lifecycle ----------
@@ -143,12 +151,14 @@ async function decide(id, single, deadline) {
             showObservation(world.observe(), 'Current state');
             return { ...bot.decide(world), actor: 'Bot' };
         }
+        case 'decision':
         case 'ollama': {
-            if (!settings.model) {
-                ollamaFailed('Pick a model first (Ollama settings).');
+            const pilot = MODEL_PILOTS[settings.controller];
+            if (!pilot.model()) {
+                ollamaFailed('Pick a model first (Ollama settings).', pilot.actor);
                 return null;
             }
-            if (!inflight) inflight = startThinking();
+            if (!inflight) inflight = startThinking(pilot);
             const mine = inflight;
             const waitFor = turnBased
                 ? mine.promise
@@ -157,42 +167,43 @@ async function decide(id, single, deadline) {
             if (result === INTERRUPTED || id !== runId || inflight !== mine) return null;
             if (result === TIMEOUT) {
                 stats.missed++;
-                return { action: 'STAY', actor: 'LLM (still thinking)', missed: true };
+                return { action: 'STAY', actor: `${pilot.actor} (still thinking)`, missed: true };
             }
             inflight = null;
             if (result.error) {
-                if (result.error.name !== 'AbortError') ollamaFailed(result.error.message);
+                if (result.error.name !== 'AbortError') ollamaFailed(result.error.message, pilot.actor);
                 return null;
             }
-            return { ...result, actor: 'LLM', stale: world.tick - result.forTick };
+            return { ...result, actor: pilot.actor, fromModel: true, stale: world.tick - result.forTick };
         }
     }
 }
 
-function startThinking() {
+function startThinking(pilot) {
     const obs = world.observe();
     const forTick = world.tick;
-    showObservation(obs, `Sent to model · turn ${forTick}`);
+    showObservation(pilot.agent.stateFor(obs), `Sent to model · turn ${forTick}`);
     ui.thinkingSince = performance.now();
     const entry = { forTick };
-    entry.promise = ollama.decide(obs)
+    entry.promise = pilot.agent.decide(obs)
         .then(r => ({ ...r, forTick }), error => ({ error }))
         .finally(() => { if (inflight === entry || !inflight) ui.thinkingSince = 0; });
     return entry;
 }
 
 function abortThinking() {
-    ollama.abort();
+    llm.abort();
+    decider.abort();
     inflight = null;
     ui.thinkingSince = 0;
 }
 
-function ollamaFailed(message) {
+function ollamaFailed(message, actor = 'Ollama') {
     abortThinking();
     paused = true;
     $('ollama-error').textContent = message;
     $('ollama-error').classList.remove('hidden');
-    log('LLM', message, 'err');
+    log(actor, message, 'err');
     refreshUi();
 }
 
@@ -201,12 +212,14 @@ function applyTick(decision) {
     renderer.onTick(world);
     ui.lastAction = decision.action;
     ui.lastActionAt = performance.now();
+    ui.lastConfidence = decision.fromModel && decision.probabilities ? decision.probabilities[decision.action] : null;
 
-    if (decision.actor === 'LLM') {
+    if (decision.fromModel) {
         stats.decisions++;
         stats.latencies.push(decision.latencyMs);
         if (!decision.valid) stats.invalid++;
         if (decision.tokensPerSec) stats.lastTps = decision.tokensPerSec;
+        if (typeof decision.confidence === 'number') stats.confidences.push(decision.confidence);
         $('ollama-error').classList.add('hidden');
         showResponse(decision);
     }
@@ -215,9 +228,10 @@ function applyTick(decision) {
     if (decision.loadMs > 500) detail += ` (model load ${(decision.loadMs / 1000).toFixed(1)}s)`;
     if (decision.stale) detail += ` · ${decision.stale} tick${decision.stale > 1 ? 's' : ''} late`;
     if (decision.valid === false) detail += ' · invalid output';
+    if (ui.lastConfidence != null) detail += ` · p=${ui.lastConfidence.toFixed(2)}`;
     const quietTick = decision.actor === 'You' && decision.action === 'STAY';
-    if (!quietTick) log(decision.actor, `${decision.action}${detail}`, decision.missed ? 'warn' : decision.actor === 'LLM' ? 'llm' : '',
-        decision.actor === 'LLM' ? decision.reasoning : '');
+    if (!quietTick) log(decision.actor, `${decision.action}${detail}`, decision.missed ? 'warn' : decision.fromModel ? 'llm' : '',
+        decision.fromModel ? decision.reasoning : '');
     if (world.events.some(e => e.kind === 'destroy')) log('', 'asteroid destroyed', 'dim');
     refreshUi();
 }
@@ -228,8 +242,9 @@ function setController(c) {
     saveSettings();
     abortThinking();
     interruptAll();
+    resetStats(); // stats describe one pilot, so mixing them would mislead
     wake();
-    if (phase === 'playing') log('System', `Pilot → ${pilotLabel()}`, 'sys');
+    if (phase === 'playing') log('System', `Pilot → ${pilotLabel()} (stats reset)`, 'sys');
     refreshUi();
 }
 
@@ -282,7 +297,8 @@ window.addEventListener('keydown', e => {
     else if (key === 'r' || (key === 'Enter' && phase !== 'playing')) startGame();
     else if (key === '1') setController('keyboard');
     else if (key === '2') setController('bot');
-    else if (key === '3') setController('ollama');
+    else if (key === '3') setController('decision');
+    else if (key === '4') setController('ollama');
     else return;
     e.preventDefault();
 });
@@ -291,13 +307,16 @@ window.addEventListener('keydown', e => {
 function pilotLabel() {
     if (settings.controller === 'keyboard') return 'Keyboard';
     if (settings.controller === 'bot') return 'Heuristic bot';
+    if (settings.controller === 'decision') return `Decision · ${settings.decisionModel || 'no model'}`;
     return `LLM · ${settings.model || 'no model'}`;
 }
 
 function refreshUi() {
     for (const btn of document.querySelectorAll('[data-controller]')) btn.classList.toggle('active', btn.dataset.controller === settings.controller);
     for (const btn of document.querySelectorAll('[data-pacing]')) btn.classList.toggle('active', btn.dataset.pacing === settings.pacing);
-    $('ollama-panel').classList.toggle('dimmed', settings.controller !== 'ollama');
+    $('ollama-panel').classList.toggle('dimmed', !MODEL_PILOTS[settings.controller]);
+    $('decision-panel').classList.toggle('dimmed', settings.controller !== 'decision');
+    $('llm-panel').classList.toggle('dimmed', settings.controller !== 'ollama');
     $('tick-ms').value = settings.tickMs;
     $('tick-ms-label').textContent = settings.pacing === 'turn' ? `min ${settings.tickMs} ms / tick` : `${settings.tickMs} ms / tick`;
     $('pacing-hint').textContent = settings.pacing === 'turn'
@@ -311,24 +330,60 @@ function refreshUi() {
     $('stat-decisions').textContent = stats ? stats.decisions : 0;
     $('stat-avg').textContent = lat.length ? `${Math.round(average(lat))} ms` : '–';
     $('stat-p95').textContent = lat.length ? `${Math.round(percentile(lat, 0.95))} ms` : '–';
-    $('stat-tps').textContent = stats && stats.lastTps ? `${stats.lastTps}` : '–';
+    const showConfidence = settings.controller === 'decision' || (stats && stats.confidences.length && !stats.lastTps);
+    $('stat-tps-label').textContent = showConfidence ? 'avg confidence' : 'tokens/s';
+    $('stat-tps').textContent = showConfidence
+        ? (stats && stats.confidences.length ? average(stats.confidences).toFixed(2) : '–')
+        : (stats && stats.lastTps ? `${stats.lastTps}` : '–');
     $('stat-invalid').textContent = stats ? stats.invalid : 0;
     $('stat-missed').textContent = stats ? stats.missed : 0;
 }
 
-function showObservation(obs, title) {
+function showObservation(state, title) {
     $('obs-title').textContent = title;
-    // One line per lane: readable on a projector, unlike fully pretty-printed JSON.
-    const lanes = obs.lanes.map(l => '    ' + JSON.stringify(l)).join(',\n');
-    $('state-json').textContent =
-        `{\n  "turn": ${obs.turn},\n  "player_lane": ${obs.player_lane},\n  "lanes": [\n${lanes}\n  ]\n}`;
+    // One line per lane / per key: readable on a projector, unlike fully pretty-printed JSON.
+    if (!Object.values(state).some(Array.isArray)) {
+        $('state-json').textContent = JSON.stringify(state, null, 2);
+        return;
+    }
+    const lines = Object.entries(state).map(([k, v]) => Array.isArray(v)
+        ? `  "${k}": [\n${v.map(x => '    ' + JSON.stringify(x)).join(',\n')}\n  ]`
+        : `  "${k}": ${JSON.stringify(v)}`);
+    $('state-json').textContent = `{\n${lines.join(',\n')}\n}`;
 }
 
 function showResponse(d) {
-    $('response-meta').textContent =
-        `turn ${d.forTick} · ${d.latencyMs} ms${d.tokensPerSec ? ` · ${d.tokensPerSec} tok/s` : ''}${d.valid ? '' : ' · INVALID'}`;
+    const extra = d.tokensPerSec ? ` · ${d.tokensPerSec} tok/s`
+        : d.usage ? ` · ${d.usage.input_tokens} tokens in` : '';
+    $('response-meta').textContent = `${d.actor} · turn ${d.forTick} · ${d.latencyMs} ms${extra}${d.valid ? '' : ' · INVALID'}`;
     $('response-action').textContent = d.action;
-    $('response-reasoning').textContent = d.reasoning || (d.thinking ? '' : '(no reasoning requested)');
+    const probs = $('response-probs');
+    probs.replaceChildren();
+    probs.classList.toggle('hidden', !d.probabilities);
+    if (d.probabilities) {
+        // A decision model returns a distribution over the options: show all of it.
+        for (const a of ACTIONS) {
+            const p = d.probabilities[a] || 0;
+            const row = document.createElement('div');
+            row.className = `prob-row${a === d.action ? ' chosen' : ''}`;
+            const label = document.createElement('span');
+            label.textContent = a;
+            const bar = document.createElement('span');
+            bar.className = 'prob-bar';
+            const fill = document.createElement('span');
+            fill.style.width = `${(p * 100).toFixed(1)}%`;
+            bar.appendChild(fill);
+            const pct = document.createElement('span');
+            pct.textContent = `${(p * 100).toFixed(1)}%`;
+            row.append(label, bar, pct);
+            probs.appendChild(row);
+        }
+        let summary = `confidence ${typeof d.confidence === 'number' ? d.confidence.toFixed(2) : '–'}`;
+        if (typeof d.danger === 'number') summary += ` · in danger? p=${d.danger.toFixed(2)}`;
+        $('response-reasoning').textContent = summary;
+    } else {
+        $('response-reasoning').textContent = d.reasoning || (d.thinking ? '' : '(no reasoning requested)');
+    }
     $('response-thinking').textContent = d.thinking || '';
     $('response-thinking').classList.toggle('hidden', !d.thinking);
     $('response-raw').textContent = d.raw;
@@ -387,11 +442,12 @@ async function refreshModels() {
     status.className = 'status pending';
     status.textContent = 'connecting…';
     try {
-        const models = await ollama.listModels();
+        const models = await llm.listModels();
         const list = $('model-list');
         list.replaceChildren(...models.map(m => Object.assign(document.createElement('option'), { value: m })));
-        if (!settings.model && models.length) {
-            settings.model = models[0];
+        const chatModels = models.filter(m => !/^(nimble|tev|clef)/.test(m));
+        if (!settings.model && chatModels.length) {
+            settings.model = chatModels[0];
             $('model').value = settings.model;
             saveSettings();
         }
@@ -404,17 +460,19 @@ async function refreshModels() {
     syncAgent();
 }
 
-async function warmUp() {
-    if (!settings.model) return ollamaFailed('Pick a model first.');
-    const btn = $('btn-warmup');
+async function warmUp(pilotKey, btn) {
+    const pilot = MODEL_PILOTS[pilotKey];
+    if (!pilot.model()) return ollamaFailed('Pick a model first.', pilot.actor);
     btn.disabled = true;
     btn.textContent = 'Loading…';
     try {
-        const r = await ollama.decide(new World(1).observe());
-        log('LLM', `${settings.model} ready · ${r.latencyMs}ms (load ${(r.loadMs / 1000).toFixed(1)}s)`, 'sys');
+        // The first call loads the model into memory; the second shows the steady-state latency.
+        const first = await pilot.agent.decide(new World(1).observe());
+        const second = await pilot.agent.decide(new World(2).observe());
+        log(pilot.actor, `${pilot.model()} ready · first call ${first.latencyMs}ms (includes loading), then ${second.latencyMs}ms`, 'sys');
         $('ollama-error').classList.add('hidden');
     } catch (err) {
-        if (err.name !== 'AbortError') ollamaFailed(err.message);
+        if (err.name !== 'AbortError') ollamaFailed(err.message, pilot.actor);
     } finally {
         btn.disabled = false;
         btn.textContent = 'Warm up';
@@ -434,7 +492,11 @@ function bindSettingInput(id, key, parse = v => v, after = () => {}) {
 }
 
 function syncAgent() {
-    Object.assign(ollama, {
+    Object.assign(decider, {
+        baseUrl: settings.baseUrl, model: settings.decisionModel, digestState: settings.digestState,
+        askDanger: settings.askDanger, instructions: settings.decisionInstructions,
+    });
+    Object.assign(llm, {
         baseUrl: settings.baseUrl, model: settings.model, temperature: settings.temperature,
         withReasoning: settings.withReasoning, disableThinking: settings.disableThinking,
         systemPrompt: settings.systemPrompt,
@@ -457,7 +519,12 @@ function init(sprites) {
     $('btn-step').addEventListener('click', step);
     $('btn-dice').addEventListener('click', () => { $('seed').value = Math.floor(Math.random() * 1e6); $('seed').dispatchEvent(new Event('input')); });
     $('btn-refresh-models').addEventListener('click', refreshModels);
-    $('btn-warmup').addEventListener('click', warmUp);
+    $('btn-warmup').addEventListener('click', e => warmUp('ollama', e.currentTarget));
+    $('btn-warmup-decision').addEventListener('click', e => warmUp('decision', e.currentTarget));
+    $('btn-reset-instructions').addEventListener('click', () => {
+        $('decision-instructions').value = DEFAULT_DECISION_INSTRUCTIONS[settings.digestState ? 'digested' : 'raw'];
+        $('decision-instructions').dispatchEvent(new Event('input'));
+    });
     $('btn-reset-prompt').addEventListener('click', () => {
         $('system-prompt').value = DEFAULT_SYSTEM_PROMPT;
         $('system-prompt').dispatchEvent(new Event('input'));
@@ -473,6 +540,19 @@ function init(sprites) {
     bindSettingInput('with-reasoning', 'withReasoning', Boolean, syncAgent);
     bindSettingInput('disable-thinking', 'disableThinking', Boolean, syncAgent);
     bindSettingInput('system-prompt', 'systemPrompt', String, syncAgent);
+    bindSettingInput('decision-model', 'decisionModel', v => v.trim(), syncAgent);
+    bindSettingInput('ask-danger', 'askDanger', Boolean, syncAgent);
+    bindSettingInput('decision-instructions', 'decisionInstructions', String, syncAgent);
+    bindSettingInput('digest-state', 'digestState', Boolean, () => {
+        // Swap in the matching default instructions, unless the user has edited them.
+        const box = $('decision-instructions');
+        if (Object.values(DEFAULT_DECISION_INSTRUCTIONS).includes(box.value)) {
+            box.value = DEFAULT_DECISION_INSTRUCTIONS[settings.digestState ? 'digested' : 'raw'];
+            settings.decisionInstructions = box.value;
+            saveSettings();
+        }
+        syncAgent();
+    });
     $('temperature-label').textContent = Number(settings.temperature).toFixed(1);
     $('base-url').addEventListener('change', refreshModels);
 
@@ -480,7 +560,7 @@ function init(sprites) {
     renderRuns();
     refreshModels();
     showObservation(world.observe(), 'Current state');
-    log('System', 'Press Start (or Enter). Keys 1/2/3 switch pilot.', 'sys');
+    log('System', 'Press Start (or Enter). Keys 1-4 switch pilot.', 'sys');
 
     const frame = () => {
         renderer.render(world, {

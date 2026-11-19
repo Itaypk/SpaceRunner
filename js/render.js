@@ -269,6 +269,7 @@ class Renderer {
             color = '#fde68a';
         } else if (ui.lastAction && now - ui.lastActionAt < 700) {
             label = { LEFT: '◀ LEFT', RIGHT: 'RIGHT ▶', SHOOT: '✦ SHOOT', STAY: '• STAY' }[ui.lastAction];
+            if (ui.lastConfidence != null) label += ` ${Math.round(ui.lastConfidence * 100)}%`;
             color = ui.lastAction === 'SHOOT' ? '#fca5a5' : '#a7f3d0';
         }
         if (label) {

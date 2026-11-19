@@ -27,7 +27,7 @@
         </div>
         <div class="help">
             <kbd>←</kbd><kbd>→</kbd> move · <kbd>Space</kbd> shoot · <kbd>↓</kbd> stay ·
-            <kbd>P</kbd> pause · <kbd>N</kbd> step · <kbd>R</kbd> restart · <kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> pilot
+            <kbd>P</kbd> pause · <kbd>N</kbd> step · <kbd>R</kbd> restart · <kbd>1</kbd>–<kbd>4</kbd> pilot
         </div>
     </section>
 
@@ -37,8 +37,9 @@
             <h2>Pilot</h2>
             <div class="segmented">
                 <button data-controller="keyboard">Keyboard</button>
-                <button data-controller="bot">Heuristic bot</button>
-                <button data-controller="ollama">LLM (Ollama)</button>
+                <button data-controller="bot">Bot</button>
+                <button data-controller="decision">Decision</button>
+                <button data-controller="ollama">LLM</button>
             </div>
 
             <h2>Clock</h2>
@@ -68,15 +69,39 @@
                 <h2>Ollama</h2>
                 <span id="ollama-status" class="status pending">…</span>
             </div>
-            <label>Server <input id="base-url" type="text" spellcheck="false"></label>
-            <label>Model
+            <label>Server
                 <span class="row inline">
-                    <input id="model" type="text" list="model-list" placeholder="e.g. qwen3:8b" spellcheck="false">
-                    <button id="btn-refresh-models" title="Reload model list">↻</button>
-                    <button id="btn-warmup" title="Load the model into memory before the demo">Warm up</button>
+                    <input id="base-url" type="text" spellcheck="false">
+                    <button id="btn-refresh-models" title="Reconnect and reload the model list">↻</button>
                 </span>
             </label>
             <datalist id="model-list"></datalist>
+
+            <div id="decision-panel" class="sub">
+                <h3>Decision model <code>POST /v1/systemone</code></h3>
+                <label>Model
+                    <span class="row inline">
+                        <input id="decision-model" type="text" list="model-list" placeholder="nimble" spellcheck="false">
+                        <button id="btn-warmup-decision" title="Load the model into memory before the demo">Warm up</button>
+                    </span>
+                </label>
+                <label class="check"><input id="digest-state" type="checkbox"> Pre-digested state (lane facts computed in code)</label>
+                <label class="check"><input id="ask-danger" type="checkbox"> Also ask "in danger?" (2nd question, costs latency)</label>
+                <details>
+                    <summary>Question instructions</summary>
+                    <textarea id="decision-instructions" rows="10" spellcheck="false"></textarea>
+                    <button id="btn-reset-instructions">Reset to default</button>
+                </details>
+            </div>
+
+            <div id="llm-panel" class="sub">
+                <h3>Chat LLM <code>POST /api/chat</code></h3>
+                <label>Model
+                    <span class="row inline">
+                        <input id="model" type="text" list="model-list" placeholder="e.g. qwen3:8b" spellcheck="false">
+                        <button id="btn-warmup" title="Load the model into memory before the demo">Warm up</button>
+                    </span>
+                </label>
             <label class="slider">Temperature
                 <input id="temperature" type="range" min="0" max="1.5" step="0.1">
                 <span id="temperature-label" class="short"></span>
@@ -88,6 +113,7 @@
                 <textarea id="system-prompt" rows="14" spellcheck="false"></textarea>
                 <button id="btn-reset-prompt">Reset to default</button>
             </details>
+            </div>
             <div id="ollama-error" class="error hidden"></div>
         </div>
 
@@ -97,7 +123,7 @@
                 <div><span id="stat-decisions">0</span>decisions</div>
                 <div><span id="stat-avg">–</span>avg latency</div>
                 <div><span id="stat-p95">–</span>p95 latency</div>
-                <div><span id="stat-tps">–</span>tokens/s</div>
+                <div><span id="stat-tps">–</span><em id="stat-tps-label">tokens/s</em></div>
                 <div><span id="stat-invalid">0</span>invalid outputs</div>
                 <div><span id="stat-missed">0</span>ticks w/o decision</div>
             </div>
@@ -123,6 +149,7 @@
                 <span id="response-action" class="action">–</span>
                 <span id="response-reasoning" class="reasoning"></span>
             </div>
+            <div id="response-probs" class="probs hidden"></div>
             <pre id="response-thinking" class="code thinking hidden"></pre>
             <details>
                 <summary>Raw output</summary>
