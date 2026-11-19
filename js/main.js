@@ -20,6 +20,7 @@ const DEFAULT_SETTINGS = {
     withReasoning: true, disableThinking: true, systemPrompt: DEFAULT_SYSTEM_PROMPT,
     decisionModel: 'nimble', digestState: true, askDanger: false,
     decisionInstructions: DEFAULT_DECISION_INSTRUCTIONS.digested,
+    ruleExplosive: false,
 };
 const settings = { ...DEFAULT_SETTINGS, ...readStorage('spacerunner.settings', {}) };
 function readStorage(key, fallback) {
@@ -41,7 +42,10 @@ const MODEL_PILOTS = {
     ollama: { agent: llm, actor: 'LLM', model: () => settings.model },
 };
 let renderer;
-let world = new World(settings.seed);
+/** Active rule changes, shared with the world so they can be toggled mid-game. */
+const activeRules = { explosive: settings.ruleExplosive };
+const ruleNotes = () => Object.keys(RULE_CHANGES).filter(k => activeRules[k]).map(k => RULE_CHANGES[k].text).join('\n');
+let world = new World(settings.seed, activeRules);
 let phase = 'menu';            // 'menu' | 'playing' | 'over'
 let paused = false;
 let stepRequested = false;
@@ -79,13 +83,13 @@ function startGame(seed = settings.seed) {
     runId++;
     abortThinking();
     interruptAll();
-    world = new World(seed);
+    world = new World(seed, activeRules);
     renderer.reset();
     resetStats();
     pendingKey = null;
     phase = 'playing';
     $('overlay').classList.add('hidden');
-    log('System', `New game · seed ${seed} · ${pilotLabel()} · ${settings.pacing}`, 'sys');
+    log('System', `New game · seed ${seed} · ${pilotLabel()} · ${settings.pacing}${activeRules.explosive ? ' · rule: explosive' : ''}`, 'sys');
     refreshUi();
     loop(runId);
 }
@@ -94,10 +98,12 @@ function gameOver() {
     phase = 'over';
     abortThinking();
     const crash = world.events.find(e => e.kind === 'crash');
-    log('System', `Crashed into ${crash ? crash.type : 'an asteroid'} · score ${world.score}`, 'err');
+    const cause = !crash ? 'Crashed' : crash.cause === 'detonated' ? 'Shot an explosive asteroid' : `Crashed into ${crash.type}`;
+    log('System', `${cause} · score ${world.score}`, 'err');
     const avg = average(stats.latencies);
     runs.unshift({
         pilot: pilotLabel(), pacing: settings.pacing, seed: world.seed, score: world.score,
+        rules: activeRules.explosive ? 'explosive' : '',
         destroyed: world.destroyed, avgMs: avg ? Math.round(avg) : null, missed: stats.missed,
     });
     runs = runs.slice(0, 30);
@@ -106,8 +112,7 @@ function gameOver() {
     setTimeout(() => {
         if (phase !== 'over') return;
         $('overlay-title').textContent = 'Crashed';
-        $('overlay-subtitle').textContent =
-            `Score ${world.score} · ${world.destroyed} destroyed · ${crash ? crash.type : ''} asteroid`;
+        $('overlay-subtitle').textContent = `${cause} · score ${world.score} · ${world.destroyed} destroyed`;
         $('btn-start').textContent = 'Retry same field';
         $('overlay').classList.remove('hidden');
     }, 900);
@@ -231,7 +236,7 @@ function applyTick(decision) {
     if (ui.lastConfidence != null) detail += ` · p=${ui.lastConfidence.toFixed(2)}`;
     const quietTick = decision.actor === 'You' && decision.action === 'STAY';
     if (!quietTick) log(decision.actor, `${decision.action}${detail}`, decision.missed ? 'warn' : decision.fromModel ? 'llm' : '',
-        decision.fromModel ? decision.reasoning : '');
+        decision.fromModel || /doesn't know/.test(decision.reasoning || '') ? decision.reasoning : '');
     if (world.events.some(e => e.kind === 'destroy')) log('', 'asteroid destroyed', 'dim');
     refreshUi();
 }
@@ -420,7 +425,7 @@ function renderRuns() {
     body.replaceChildren();
     for (const r of runs) {
         const tr = document.createElement('tr');
-        for (const v of [r.pilot, r.pacing === 'turn' ? 'turn' : 'real-time', r.seed, r.score, r.destroyed,
+        for (const v of [r.pilot, r.pacing === 'turn' ? 'turn' : 'real-time', r.rules || '–', r.seed, r.score, r.destroyed,
             r.avgMs === null ? '–' : `${r.avgMs}`, r.missed]) {
             const td = document.createElement('td');
             td.textContent = v;
@@ -491,7 +496,20 @@ function bindSettingInput(id, key, parse = v => v, after = () => {}) {
     });
 }
 
+function setRule(key, on) {
+    activeRules[key] = on;
+    settings.ruleExplosive = activeRules.explosive;
+    saveSettings();
+    $('rule-text').classList.toggle('hidden', !on);
+    if (phase === 'playing') {
+        log('System', on ? `Rule change: ${RULE_CHANGES[key].title} (new spawns only). Models get 1 extra sentence, the bot gets nothing.`
+            : `Rule change off: ${RULE_CHANGES[key].title}`, 'warn');
+    }
+    syncAgent();
+}
+
 function syncAgent() {
+    decider.ruleNotes = llm.ruleNotes = ruleNotes();
     Object.assign(decider, {
         baseUrl: settings.baseUrl, model: settings.decisionModel, digestState: settings.digestState,
         askDanger: settings.askDanger, instructions: settings.decisionInstructions,
@@ -531,6 +549,10 @@ function init(sprites) {
     });
     $('btn-clear-runs').addEventListener('click', () => { runs = []; writeStorage('spacerunner.runs', runs); renderRuns(); });
 
+    $('rule-explosive').checked = activeRules.explosive;
+    $('rule-explosive').addEventListener('change', e => setRule('explosive', e.target.checked));
+    $('rule-text').textContent = RULE_CHANGES.explosive.text;
+    $('rule-text').classList.toggle('hidden', !activeRules.explosive);
     bindSettingInput('tick-ms', 'tickMs', Number, refreshUi);
     bindSettingInput('seed', 'seed', v => Math.max(0, parseInt(v, 10) || 0));
     bindSettingInput('show-overlay', 'showOverlay');

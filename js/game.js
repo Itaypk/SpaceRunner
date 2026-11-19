@@ -19,6 +19,20 @@ const ASTEROID_TYPES = {
     ice:   { hp: 1 },
     stone: { hp: 2 },
     metal: { hp: Infinity },  // indestructible: must be dodged
+    explosive: { hp: Infinity }, // only with the "explosive" rule: shooting it destroys the ship
+};
+
+/**
+ * Rule changes that can be switched on mid-game. The point: the heuristic bot's rules are
+ * hard-coded and don't know about them; model pilots get one extra sentence of instructions.
+ */
+const RULE_CHANGES = {
+    explosive: {
+        title: 'Explosive asteroids',
+        text: 'NEW RULE: some asteroids are now "explosive" (glowing red). An explosive asteroid cannot be destroyed: ' +
+            'shooting it detonates it and the blast destroys the ship. Never shoot when the nearest asteroid in the ' +
+            'ship\'s lane is explosive; dodge it like metal.',
+    },
 };
 
 /** Small seeded PRNG (mulberry32) so a seed always produces the same asteroid field. */
@@ -67,10 +81,13 @@ class Track {
         let spawn = null;
         if (tick > 0 && spawnRoll < spawnChance && tick - this.lastSpawnTick[lane] >= 2) {
             let type = typeRoll > 0.82 ? 'metal' : typeRoll > 0.45 ? 'stone' : 'ice';
-            if (type === 'metal' && !this.metalIsFair(tick, lane)) type = 'stone';
-            spawn = { lane, type, variant: variantRoll };
+            if (type === 'metal' && !this.blockerIsFair(tick, lane)) type = 'stone';
+            // Some ice/stone spawns become explosive when that rule is on. Like metal they must be
+            // dodged, so they're part of the fairness check whether or not the rule is active.
+            const explosiveCandidate = type !== 'metal' && variantRoll < 0.2 && this.blockerIsFair(tick, lane);
+            spawn = { lane, type, variant: variantRoll, explosiveCandidate };
             this.lastSpawnTick[lane] = tick;
-            if (type === 'metal') this.blockedSet(tick + Track.TICKS_TO_PLAYER).add(lane);
+            if (type === 'metal' || explosiveCandidate) this.blockedSet(tick + Track.TICKS_TO_PLAYER).add(lane);
         }
         this.spawns.push(spawn);
     }
@@ -80,16 +97,18 @@ class Track {
         return this.metalAtPlayerRow[tick];
     }
 
-    /** Would a metal asteroid spawned now in `lane` still leave a survivable path? */
-    metalIsFair(tick, lane) {
+    /** Would an undestroyable asteroid spawned now in `lane` still leave a survivable path? */
+    blockerIsFair(tick, lane) {
         const arrival = tick + Track.TICKS_TO_PLAYER;
-        const blocked = (t, l) => this.blockedSet(t).has(l) || (t === arrival && l === lane);
-        let lanes = this.reachable[0];
-        for (let t = 1; t <= arrival; t++) {
-            lanes = Track.advance(lanes, t, blocked);
-            if (lanes.size === 0) return false;
+        // Everything up to arrival - 1 is already final (later spawns arrive later), so
+        // only the arrival tick needs checking against the cached reachable lanes.
+        const known = (t, l) => this.blockedSet(t).has(l);
+        while (this.reachable.length < arrival) {
+            const t = this.reachable.length;
+            this.reachable.push(Track.advance(this.reachable[t - 1], t, known));
         }
-        return true;
+        const withNew = (t, l) => known(t, l) || (t === arrival && l === lane);
+        return Track.advance(this.reachable[arrival - 1], arrival, withNew).size > 0;
     }
 
     /** Lanes the player can occupy at the end of tick t, given the lanes at t-1. */
@@ -111,8 +130,9 @@ class Track {
 Track.TICKS_TO_PLAYER = PLAYER_ROW + 1;
 
 class World {
-    constructor(seed) {
+    constructor(seed, rules = {}) {
         this.seed = seed;
+        this.rules = rules;       // active rule changes, e.g. { explosive: true }; shared, may change mid-game
         this.track = new Track(seed);
         this.tick = 0;
         this.playerLane = START_LANE;
@@ -169,7 +189,9 @@ class World {
         for (const laser of this.lasers) {
             for (let s = 0; s <= LASER_SPEED && !laser.done; s++) {
                 if (s > 0) laser.row--;
-                if (laser.row < 0) { laser.done = true; break; }
+                // Lasers fade out before the top row, so they only ever hit asteroids that were
+                // visible when the shot was decided (a new asteroid is at row 0 after its first fall).
+                if (laser.row < 1) { laser.done = true; break; }
                 const target = this.asteroids.find(a => a.lane === laser.lane && a.row === laser.row && a.hp > 0);
                 if (target) {
                     laser.done = true;
@@ -177,6 +199,7 @@ class World {
                 }
             }
         }
+        if (this.status !== 'playing') return; // shot an explosive asteroid
         this.lasers = this.lasers.filter(l => !l.done);
         this.asteroids = this.asteroids.filter(a => a.hp > 0 && a.row <= ROWS);
 
@@ -187,9 +210,10 @@ class World {
         if (spawn) {
             const s = this.track.spawnFor(this.tick);
             if (s) {
+                const type = s.explosiveCandidate && this.rules.explosive ? 'explosive' : s.type;
                 this.asteroids.push({
-                    id: this.nextId++, lane: s.lane, row: -1, type: s.type,
-                    hp: ASTEROID_TYPES[s.type].hp, variant: s.variant,
+                    id: this.nextId++, lane: s.lane, row: -1, type,
+                    hp: ASTEROID_TYPES[type].hp, variant: s.variant,
                 });
             }
         }
@@ -199,6 +223,13 @@ class World {
         const at = { kind: '', id: asteroid.id, laserId: laser.id, lane: asteroid.lane, row: asteroid.row, type: asteroid.type };
         if (asteroid.type === 'metal') {
             this.events.push({ ...at, kind: 'deflect' });
+            return;
+        }
+        if (asteroid.type === 'explosive') {
+            asteroid.hp = 0;
+            this.status = 'crashed';
+            this.events.push({ ...at, kind: 'detonate' });
+            this.events.push({ kind: 'crash', id: asteroid.id, type: 'explosive', cause: 'detonated', lane: this.playerLane });
             return;
         }
         asteroid.hp--;
@@ -231,7 +262,7 @@ class World {
                 .slice(0, 3)
                 .map(a => {
                     const o = { type: a.type, rows_away: PLAYER_ROW - a.row };
-                    if (a.type !== 'metal') o.hits_left = a.hp;
+                    if (a.type === 'ice' || a.type === 'stone') o.hits_left = a.hp;
                     return o;
                 });
             const lasers = this.lasers.filter(l => l.lane === lane).length;

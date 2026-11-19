@@ -18,15 +18,29 @@ const SPRITE_NAMES = [
     'laser_a', 'laser_b', 'spark_a', 'spark_b', 'explosion', 'smoke',
 ];
 
-function loadSprites() {
-    const sprites = {};
-    const loads = SPRITE_NAMES.map(name => new Promise(resolve => {
+// Sprites that may not have real art yet: use <name>.png if present, else <name>_placeholder.png.
+const OPTIONAL_SPRITES = ['explosive'];
+
+function loadImage(src) {
+    return new Promise(resolve => {
         const img = new Image();
-        img.onload = () => { sprites[name] = img; resolve(); };
-        img.onerror = () => { console.warn(`sprite ${name} failed to load`); resolve(); };
-        img.src = `assets/sprites/${name}.png`;
+        img.onload = () => resolve(img);
+        img.onerror = () => resolve(null);
+        img.src = src;
+    });
+}
+
+async function loadSprites() {
+    const sprites = {};
+    await Promise.all(SPRITE_NAMES.map(async name => {
+        sprites[name] = await loadImage(`assets/sprites/${name}.png`);
+        if (!sprites[name]) console.warn(`sprite ${name} failed to load`);
     }));
-    return Promise.all(loads).then(() => sprites);
+    await Promise.all(OPTIONAL_SPRITES.map(async name => {
+        sprites[name] = await loadImage(`assets/sprites/${name}.png`)
+            || await loadImage(`assets/sprites/${name}_placeholder.png`);
+    }));
+    return sprites;
 }
 
 class Renderer {
@@ -87,6 +101,10 @@ class Renderer {
                     this.addEffect(e.type === 'ice' ? 'ice_shards' : 'stone_debris_b', x, y, 105, 450, { grow: 0.5 });
                     this.addEffect('spark_b', x, y + 20, 70, 220);
                     break;
+                case 'detonate':
+                    this.addEffect('explosion', x, y, 190, 700, { grow: 0.4 });
+                    this.addEffect('smoke', x, y, 200, 1500, { delay: 400, grow: 0.3 });
+                    break;
                 case 'crash':
                     this.addEffect('explosion', this.ship.x, rowY(PLAYER_ROW), 150, 650, { grow: 0.3 });
                     this.addEffect('smoke', this.ship.x, rowY(PLAYER_ROW), 170, 1600, { delay: 450, grow: 0.25 });
@@ -118,6 +136,7 @@ class Renderer {
         const pick = list => list[Math.floor(a.variant * list.length) % list.length];
         if (a.type === 'ice') return { name: pick(['ice_a', 'ice_b']), size: 88, spin: 0.4 };
         if (a.type === 'metal') return { name: pick(['metal_a', 'metal_b', 'metal_c']), size: 100, spin: 0.15 };
+        if (a.type === 'explosive') return { name: 'explosive', size: 90, spin: 0.6, pulse: true };
         return { name: a.hp >= 2 ? pick(['stone_a', 'stone_b', 'stone_c']) : 'stone_cracked', size: 96, spin: 0.3 };
     }
 
@@ -170,8 +189,16 @@ class Renderer {
             if (!v) { v = { x: tx, y: ty - ROW_H, flashUntil: 0 }; this.visuals.set(a.id, v); }
             v.y += (ty - v.y) * ease;
             v.x = tx;
-            const { name, size, spin } = this.asteroidSprite(a);
+            const { name, size, spin, pulse } = this.asteroidSprite(a);
             const rotation = (now / 1000) * spin * (a.variant > 0.5 ? 1 : -1) + a.variant * 6;
+            if (pulse) { // unstable: a throbbing red glow behind it
+                const glow = 0.35 + 0.25 * Math.sin(now / 140);
+                const g = ctx.createRadialGradient(v.x, v.y, 10, v.x, v.y, size * 0.75);
+                g.addColorStop(0, `rgba(255, 80, 40, ${glow})`);
+                g.addColorStop(1, 'rgba(255, 80, 40, 0)');
+                ctx.fillStyle = g;
+                ctx.fillRect(v.x - size, v.y - size, size * 2, size * 2);
+            }
             this.drawSprite(name, v.x, v.y, size, rotation);
             if (v.flashUntil > now) {
                 ctx.save();
@@ -219,7 +246,7 @@ class Renderer {
         const ctx = this.ctx;
         const danger = rowsAway <= 2;
         ctx.fillStyle = danger ? 'rgba(239, 68, 68, 0.9)' : 'rgba(15, 23, 42, 0.85)';
-        ctx.strokeStyle = type === 'metal' ? '#94a3b8' : type === 'ice' ? '#67e8f9' : '#d6b98c';
+        ctx.strokeStyle = { metal: '#94a3b8', ice: '#67e8f9', stone: '#d6b98c', explosive: '#f87171' }[type] || '#f8fafc';
         ctx.lineWidth = 1.5;
         ctx.beginPath();
         ctx.roundRect(x - 15, y - 11, 30, 22, 6);

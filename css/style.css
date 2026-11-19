@@ -200,6 +200,7 @@ details summary { cursor: pointer; font-size: 12px; color: var(--muted); }
     word-break: break-word;
 }
 .code.thinking { color: #c4b5fd; max-height: 140px; }
+.code.rule { color: #fca5a5; }
 
 .decision { display: flex; gap: 12px; align-items: baseline; }
 .decision .action { font: 800 22px var(--mono); color: var(--warn); min-width: 80px; }

@@ -80,6 +80,24 @@ def cut(img: np.ndarray, box) -> Image.Image:
     return out
 
 
+def recolor(sprite: Image.Image, hue_shift: int, saturation: float) -> Image.Image:
+    """Hue-rotate a sprite (hue_shift in 0..255 units), keeping its alpha."""
+    alpha = sprite.getchannel("A")
+    h, s, v = sprite.convert("RGB").convert("HSV").split()
+    h = h.point(lambda x: (x + hue_shift) % 256)
+    s = s.point(lambda x: min(255, int(x * saturation)))
+    out = Image.merge("HSV", (h, s, v)).convert("RGB")
+    out.putalpha(alpha)
+    return out
+
+
+# Placeholders derived from existing sprites, saved as <name>_placeholder.png.
+# The game prefers a hand-made <name>.png when one exists, so real art just gets dropped in.
+DERIVED = {
+    "explosive": ("ice_b", 125, 2.2),   # red-orange "unstable crystal"
+}
+
+
 def main():
     img = np.array(Image.open(SRC).convert("RGB"))
     OUT.mkdir(parents=True, exist_ok=True)
@@ -87,6 +105,9 @@ def main():
         sprite = cut(img, box)
         sprite.save(OUT / f"{name}.png", optimize=True)
         print(f"{name:16s} {sprite.size}")
+    for name, (source, hue_shift, saturation) in DERIVED.items():
+        recolor(Image.open(OUT / f"{source}.png"), hue_shift, saturation).save(OUT / f"{name}_placeholder.png", optimize=True)
+        print(f"{name:16s} placeholder from {source}")
 
 
 if __name__ == "__main__":

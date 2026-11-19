@@ -9,18 +9,32 @@ class HeuristicBot {
     constructor(depth = 5) {
         this.depth = depth;
         this.name = 'Heuristic bot';
+        // The bot's rulebook is frozen in code, written before any rule change existed.
+        // Like most hand-written policies ("if metal: dodge, else: shoot"), anything that
+        // isn't metal is treated as a breakable rock.
+        this.knownTypes = ['ice', 'stone', 'metal'];
     }
 
     /** Try every action sequence `depth` ticks ahead (4^5 = 1024 cheap simulations). */
     decide(world) {
         const sim = world.clone();
-        sim.asteroids = sim.asteroids.filter(a => a.row >= 0); // only what's visible
+        sim.rules = {};
+        const unknown = new Set();
+        sim.asteroids = sim.asteroids
+            .filter(a => a.row >= 0) // only what's visible
+            .map(a => {
+                if (this.knownTypes.includes(a.type)) return a;
+                unknown.add(a.type);
+                return { ...a, type: 'ice', hp: 1 };
+            });
         let best = { action: 'STAY', value: -Infinity };
         for (const action of ['STAY', 'SHOOT', 'LEFT', 'RIGHT']) {
             const value = this.search(sim, action, this.depth);
             if (value > best.value) best = { action, value };
         }
-        return { action: best.action, reasoning: `look-ahead value ${best.value.toFixed(1)}` };
+        let reasoning = `look-ahead value ${best.value.toFixed(1)}`;
+        if (unknown.size) reasoning += ` · doesn't know "${[...unknown].join(', ')}", treats it as ice`;
+        return { action: best.action, reasoning };
     }
 
     search(world, action, depth) {
@@ -74,7 +88,7 @@ If an asteroid reaches the ship's row in the ship's lane, the ship is destroyed.
 Changing lanes is only safe if the target lane has no asteroid at rows_away 0 or 1.
 Which action keeps the ship alive this turn and in the turns after it?`,
     digested: `The state describes a spaceship flying through an asteroid field, seen from above.
-\`current_lane\` is the ship's lane: \`threat\` says what is coming ("none", "shootable" for ice/stone, "must_dodge" for metal) and \`turns_to_impact\` says how soon it hits the ship if the ship stays.
+\`current_lane\` is the ship's lane: \`threat\` says what is coming ("none", "shootable" for ice/stone, "must_dodge" for metal, "unknown" for other types; \`nearest\` names the type) and \`turns_to_impact\` says how soon it hits the ship if the ship stays.
 \`left_lane\` and \`right_lane\` describe the neighbouring lanes: \`exists\` is false at the edge of the field, and \`safe_to_enter\` says whether moving there this turn is safe. Their \`threat\` and \`turns_to_impact\` describe what comes next in that lane.
 A metal asteroid can only be dodged. Ice and stone can be shot, but stone needs 2 hits (\`hits_left\`).
 Which action keeps the ship alive this turn and in the turns after it?`,
@@ -84,6 +98,8 @@ Which action keeps the ship alive this turn and in the turns after it?`,
  * Pre-compute the facts a decision model would otherwise have to work out with arithmetic
  * ("is rows_away <= 1?"), framed relative to the ship so they map onto the action options.
  */
+const THREAT_BY_TYPE = { ice: 'shootable', stone: 'shootable', metal: 'must_dodge' };
+
 function digestObservation(obs) {
     const describe = lane => {
         const info = obs.lanes[lane];
@@ -92,7 +108,8 @@ function digestObservation(obs) {
         const nearest = ahead[0];
         const out = {
             exists: true,
-            threat: !nearest ? 'none' : nearest.type === 'metal' ? 'must_dodge' : 'shootable',
+            // Facts only: a type this code doesn't know about is reported as "unknown", not guessed.
+            threat: !nearest ? 'none' : THREAT_BY_TYPE[nearest.type] || 'unknown',
         };
         if (nearest) {
             out.nearest = nearest.type;
@@ -121,6 +138,8 @@ const DEFAULT_DECISION_CRITERIA = {
     LEFT: 'Move one lane to the left (lane number - 1). Right when the current lane is threatened and the left lane is safe.',
     RIGHT: 'Move one lane to the right (lane number + 1). Right when the current lane is threatened and the right lane is safe.',
 };
+
+const withNotes = (text, notes) => notes ? `${text}\n\n${notes}` : text;
 
 /** Shared plumbing for talking to a local Ollama server. */
 class OllamaClient {
@@ -192,6 +211,7 @@ class DecisionAgent extends OllamaClient {
         this.criteria = DEFAULT_DECISION_CRITERIA;
         this.digestState = true;
         this.askDanger = false;
+        this.ruleNotes = '';      // extra rule text, appended when a rule change is active
     }
 
     /** What actually goes into `state`. */
@@ -201,7 +221,7 @@ class DecisionAgent extends OllamaClient {
 
     buildRequest(observation) {
         const questions = {
-            action: { type: 'choice', instructions: this.instructions, criteria: this.criteria },
+            action: { type: 'choice', instructions: withNotes(this.instructions, this.ruleNotes), criteria: this.criteria },
         };
         if (this.askDanger) {
             // A second, independent yes/no question. Each question is scored separately, so it costs latency.
@@ -263,6 +283,7 @@ class LlmAgent extends OllamaClient {
         this.withReasoning = true;
         this.disableThinking = true;
         this.thinkUnsupported = false; // learned from the server's response
+        this.ruleNotes = '';
     }
 
     stateFor(observation) { return observation; }
@@ -285,7 +306,7 @@ class LlmAgent extends OllamaClient {
             format: this.schema(),
             options: { temperature: this.temperature },
             messages: [
-                { role: 'system', content: `${this.systemPrompt}\n\n${responseHint}` },
+                { role: 'system', content: `${withNotes(this.systemPrompt, this.ruleNotes)}\n\n${responseHint}` },
                 { role: 'user', content: JSON.stringify(observation) },
             ],
         };

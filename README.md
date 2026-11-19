@@ -109,6 +109,29 @@ These are the main thing the demo shows.
 - **Pause + Step**: freeze the world and advance one decision at a time. Each step sends one
   request, so you can talk through the state JSON, the reasoning, and the outcome.
 
+### Rule change: explosive asteroids
+
+The **Rule change** card switches on a new asteroid type mid-game: *explosive* (glowing red).
+It can't be destroyed, and shooting it detonates it, which destroys the ship. It only affects
+asteroids that spawn after you flip the switch.
+
+- **The bot** has its rules frozen in code, like any hand-written policy ("if metal → dodge,
+  else → shoot"). It treats the unknown type as a breakable rock, shoots it, and dies, usually
+  within 10–40 ticks. The log says why: `doesn't know "explosive", treats it as ice`.
+- **The model pilots** get exactly one extra sentence appended to their instructions, shown
+  in the card. Nothing else changes: no code, no redeploy.
+- In the pre-digested state, the code reports an unknown type as `"threat": "unknown"` with
+  `"nearest": "explosive"`. It states facts and doesn't guess, so the model can apply the new rule.
+
+The honest counterpoint, in case someone raises it: a defensively written bot (unknown type →
+dodge) would have survived. A bot updated with the new rule plays well again, but someone had
+to change and ship code, while the model only needed a sentence. That trade-off is the point.
+
+**Sprite:** the explosive asteroid is currently a recoloured ice crystal
+(`assets/sprites/explosive_placeholder.png`). Drop a real `assets/sprites/explosive.png` next
+to it and the game uses that instead. A transparent PNG about 220 px on the long side matches
+the other sprites.
+
 The **seed** sets the asteroid field. The same seed always produces the same asteroids,
 whoever is flying, so you can compare models (or a model against the bot) fairly. Finished
 games are listed in the **Runs** table.
@@ -231,8 +254,11 @@ with exact rules), but plan for it.
 5. Turn **Pre-digested state** off and replay the same seed: how much does the model do on
    its own, and how much was the feature engineering?
 6. Optionally tick **Also ask "in danger?"** to show multi-question requests and their cost.
-7. End with the **Runs** table (score, avg latency, missed ticks per pilot), and maybe the bot
-   as a reality check.
+7. **The bot** (`2`): near-perfect and instant. Simple, boring and better, as long as the rules
+   are known and fixed.
+8. **Rule change**: switch on *explosive asteroids*. The bot blows itself up within seconds.
+   Switch to the decision model on the same seed: one sentence of instructions and it adapts.
+9. End with the **Runs** table (pilot, rules, score, avg latency, missed ticks).
 
 ## Game rules (exact)
 
@@ -241,8 +267,12 @@ with exact rules), but plan for it.
 - Lasers travel 4 rows per tick, checked one row at a time, so nothing gets skipped.
 - Order of one tick: apply the action → sideways collision → asteroids fall → lasers fly and
   hit → collision in the ship's row → a new asteroid may spawn.
-- The field never contains an unavoidable metal wall. The generator checks that a
-  dodge-only path survives, and turns the offending asteroid into stone if not.
+- With the rule change on, explosive asteroids also can't be destroyed, and shooting one destroys the ship.
+- Lasers fade out before the top row, so they only hit asteroids that were already visible
+  when the shot was decided.
+- The field never contains an unavoidable wall of undestroyable asteroids (metal, and
+  explosive if the rule is on). The generator checks that a dodge-only path survives, and
+  turns the offending asteroid into a normal one if not.
 - Score = ticks survived.
 
 ## Project structure
