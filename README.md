@@ -304,3 +304,12 @@ boxes and background test.
 - **Streaming** the reasoning tokens into the panel, so people watch it think.
 - **Post-mortem on crash**: send the last few turns back to the model and ask what went wrong.
 - **Export a run** as JSONL (observation, prompt, response, outcome) for later analysis.
+
+## Credits and license
+
+- Code: [MIT](LICENSE).
+- Sprites (`assets/spritesheet.jpeg`, `assets/spritesheet2.webp` and the PNGs cut from
+  them) were generated with Google Gemini. The original sheet keeps Google's C2PA content
+  credentials marking it as AI-generated. They're included under the same MIT terms as far
+  as any rights in them exist; copyright protection for purely AI-generated images is unsettled in many
+  jurisdictions.
