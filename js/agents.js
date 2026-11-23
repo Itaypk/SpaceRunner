@@ -79,9 +79,11 @@ ACTIONS
 
 Each turn you receive the current state as JSON: per lane, the nearest asteroids (closest first) and any lasers already in flight.
 
-STRATEGY
-- Only change lanes when your own lane is threatened by something you can't shoot in time.
-  Every move into another lane is a risk.
+STRATEGY: act early, because your answers can arrive a turn or two late.
+- Shoot ice and stone as soon as they are in your lane, however far away. Don't wait for them to come close.
+  Lasers already in flight count: shoot again only if hits_left is more than lasers_in_flight in your lane.
+- Dodge metal early: as soon as metal is in your lane, move to a neighbouring lane that is safe to enter.
+- Don't change lanes for anything you can shoot. Every move into another lane is a risk.
 - Before choosing LEFT or RIGHT, check the target lane: any asteroid there with rows_away 0 or 1 means a crash.
 
 Survive as long as possible. Destroying asteroids is a bonus, surviving is what counts.`;
@@ -91,12 +93,14 @@ const DEFAULT_DECISION_INSTRUCTIONS = {
     raw: `The state describes a spaceship in a 4-lane asteroid field, seen from above. Lanes are numbered 0 (far left) to 3 (far right); the ship is in \`player_lane\`.
 Each entry in \`lanes\` lists that lane's nearest asteroids, closest first. \`rows_away\` is how many turns until the asteroid reaches the ship's row; asteroids move 1 row per turn.
 If an asteroid reaches the ship's row in the ship's lane, the ship is destroyed. Ice needs 1 laser hit, stone needs 2 (\`hits_left\`), metal cannot be destroyed and must be dodged.
-Changing lanes is only safe if the target lane has no asteroid at rows_away 0 (beside the ship) or 1, even when the ship's own lane is clear. Only change lanes when the ship's own lane is threatened.
+Changing lanes is only safe if the target lane has no asteroid at rows_away 0 (beside the ship) or 1, even when the ship's own lane is clear.
+Act early, because the decision may be applied a turn or two late: shoot ice and stone in the ship's lane as soon as they appear, however far away, unless enough lasers are already in flight (\`lasers_in_flight\`); move away from metal as soon as it is in the ship's lane. Only change lanes for something that can't be shot.
 Which action keeps the ship alive this turn and in the turns after it?`,
     digested: `The state describes a spaceship flying through an asteroid field, seen from above.
 \`current_lane\` is the ship's lane: \`threat\` says what is coming ("none", "shootable" for ice/stone, "must_dodge" for metal, "unknown" for other types; \`nearest\` names the type) and \`turns_to_impact\` says how soon it hits the ship if the ship stays.
 \`left_lane\` and \`right_lane\` describe the neighbouring lanes: \`exists\` is false at the edge of the field, and \`safe_to_enter\` says whether moving there this turn is safe; if not, \`blocked_by\` says why, and moving there crashes the ship. Their \`threat\` and \`turns_to_impact\` describe what comes next in that lane.
-Only change lanes when the ship's own lane is threatened, and never into a lane that isn't safe to enter.
+\`shots_needed\` is how many more lasers the nearest shootable asteroid in the ship's lane needs, counting lasers already on their way.
+Act early, because the decision may be applied a turn or two late: if \`shots_needed\` is above 0, shoot now, however far away the asteroid is. If the threat is "must_dodge" or "unknown", move to a neighbouring lane that is safe to enter, preferably one without a threat, as soon as it appears. Never move into a lane that isn't safe to enter, and don't change lanes for something that can be shot.
 A metal asteroid can only be dodged. Ice and stone can be shot, but stone needs 2 hits (\`hits_left\`).
 Which action keeps the ship alive this turn and in the turns after it?`,
 };
@@ -137,15 +141,20 @@ function digestObservation(obs) {
         return { ...out, ...d };
     };
     const lane = obs.player_lane;
-    return { turn: obs.turn, current_lane: describe(lane), left_lane: side(lane - 1), right_lane: side(lane + 1) };
+    const current = describe(lane);
+    if (current.threat === 'shootable') {
+        // Arithmetic the model shouldn't have to do: hits still needed minus lasers already on the way.
+        current.shots_needed = Math.max(0, (current.hits_left || 1) - (current.lasers_in_flight || 0));
+    }
+    return { turn: obs.turn, current_lane: current, left_lane: side(lane - 1), right_lane: side(lane + 1) };
 }
 
 // Option descriptions for the choice question. Order matters: ties go to the earlier option.
 const DEFAULT_DECISION_CRITERIA = {
-    STAY: 'Stay in the current lane and do nothing. Right when nothing in the ship\'s lane is about to arrive.',
-    SHOOT: 'Fire a laser up the current lane. Right when the nearest asteroid in the ship\'s lane is ice or stone.',
-    LEFT: 'Move one lane to the left (lane number - 1). Only right when the current lane is threatened and the left lane is safe to enter; a crash if anything in the left lane is beside the ship or arrives next turn.',
-    RIGHT: 'Move one lane to the right (lane number + 1). Only right when the current lane is threatened and the right lane is safe to enter; a crash if anything in the right lane is beside the ship or arrives next turn.',
+    STAY: 'Stay in the current lane and do nothing. Only right when nothing is coming in the ship\'s lane, or the lasers already in flight will destroy what is coming.',
+    SHOOT: 'Fire a laser up the current lane. Right whenever ice or stone is coming in the ship\'s lane and still needs more shots, even if it is far away: shooting early is better than shooting late.',
+    LEFT: 'Move one lane to the left (lane number - 1). Right as soon as something that can\'t be shot (metal) is coming in the ship\'s lane, even several turns away, and the left lane is safe to enter. A crash if anything in the left lane is beside the ship or arrives next turn.',
+    RIGHT: 'Move one lane to the right (lane number + 1). Right as soon as something that can\'t be shot (metal) is coming in the ship\'s lane, even several turns away, and the right lane is safe to enter. A crash if anything in the right lane is beside the ship or arrives next turn.',
 };
 
 const withNotes = (text, notes) => notes ? `${text}\n\n${notes}` : text;
@@ -153,8 +162,8 @@ const withNotes = (text, notes) => notes ? `${text}\n\n${notes}` : text;
 /** Fingerprints of earlier default prompts, so saved-but-unedited copies get upgraded. */
 const promptHash = s => { let x = 5381; for (let i = 0; i < s.length; i++) x = ((x * 33) ^ s.charCodeAt(i)) >>> 0; return x; };
 const LEGACY_DEFAULT_HASHES = {
-    systemPrompt: [462703211],
-    decisionInstructions: [3465441998, 247429411], // raw, digested
+    systemPrompt: [462703211, 1336443016],
+    decisionInstructions: [3465441998, 247429411, 1909348632, 2125928251], // raw, digested per version
 };
 
 /** Shared plumbing for talking to a local Ollama server. */
@@ -298,8 +307,15 @@ class LlmAgent extends OllamaClient {
         this.temperature = 0.2;
         this.withReasoning = true;
         this.disableThinking = true;
-        this.thinkUnsupported = false; // learned from the server's response
         this.ruleNotes = '';
+        // Options a model turned out not to support, learned from the server's errors, per model.
+        this.unsupported = {};       // model -> { think: true, format: true }
+    }
+
+    lacks(option) { return !!(this.unsupported[this.model] || {})[option]; }
+
+    markUnsupported(option) {
+        this.unsupported[this.model] = { ...this.unsupported[this.model], [option]: true };
     }
 
     stateFor(observation) { return observation; }
@@ -319,31 +335,43 @@ class LlmAgent extends OllamaClient {
             model: this.model,
             stream: false,
             keep_alive: '30m',
-            format: this.schema(),
             options: { temperature: this.temperature },
             messages: [
                 { role: 'system', content: `${withNotes(this.systemPrompt, this.ruleNotes)}\n\n${responseHint}` },
                 { role: 'user', content: JSON.stringify(observation) },
             ],
         };
+        // Structured output: Ollama constrains the answer to the schema. Without it we rely on the
+        // prompt alone and parse defensively.
+        if (!this.lacks('format')) body.format = this.schema();
         // Thinking models (qwen3, deepseek-r1, ...) can be several times slower when they think.
-        if (this.disableThinking && !this.thinkUnsupported) body.think = false;
+        if (this.disableThinking && !this.lacks('think')) body.think = false;
         return body;
     }
 
-    /** Returns { action, reasoning, thinking, raw, valid, latencyMs, tokensPerSec, loadMs, request }. */
+    /**
+     * Returns { action, reasoning, thinking, raw, valid, latencyMs, tokensPerSec, loadMs, request, warning }.
+     * An option the model rejects (thinking switch, structured output) is dropped and the call
+     * retried once; for structured output that's a warning, not an error.
+     */
     async decide(observation) {
         const request = this.buildRequest(observation);
         let result;
         try {
             result = await this.post('/api/chat', request);
         } catch (err) {
-            if (err instanceof OllamaError && request.think === false && /think/i.test(err.message)) {
-                this.thinkUnsupported = true; // older server or model without the option: retry once
+            if (!(err instanceof OllamaError)) throw err;
+            if (request.think === false && /think/i.test(err.message)) {
+                this.markUnsupported('think');
                 return this.decide(observation);
             }
-            if (err instanceof OllamaError) throw new OllamaError(`Ollama error: ${err.message}`, err.status);
-            throw err;
+            if (request.format && /format|structured|schema|grammar|json/i.test(err.message)) {
+                this.markUnsupported('format');
+                const retried = await this.decide(observation);
+                return { ...retried, warning: `${this.model} doesn't support structured outputs ("${err.message}"). ` +
+                    'Continuing with prompt-only JSON, so invalid answers are more likely.' };
+            }
+            throw new OllamaError(`Ollama error: ${err.message}`, err.status);
         }
         const { data, latencyMs } = result;
         const raw = (data.message && data.message.content) || '';

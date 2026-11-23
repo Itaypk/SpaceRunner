@@ -250,6 +250,16 @@ function animationMs(single) {
     return Math.min(1500, Math.max(settings.tickMs, tickIntervalAvg));
 }
 
+/** Non-fatal model problems (e.g. no structured outputs): shown once per message, game goes on. */
+const shownWarnings = new Set();
+function showWarning(message) {
+    $('ollama-warning').textContent = message;
+    $('ollama-warning').classList.remove('hidden');
+    if (shownWarnings.has(message)) return;
+    shownWarnings.add(message);
+    log('Warning', message, 'warn');
+}
+
 function applyTick(decision, single = false) {
     const before = world.observe();
     world.step(decision.action);
@@ -267,6 +277,7 @@ function applyTick(decision, single = false) {
         if (decision.tokensPerSec) stats.lastTps = decision.tokensPerSec;
         if (typeof decision.confidence === 'number') stats.confidences.push(decision.confidence);
         $('ollama-error').classList.add('hidden');
+        if (decision.warning) showWarning(decision.warning);
         showResponse(decision);
     }
     let detail = '';
@@ -552,6 +563,8 @@ function setRule(key, on) {
 }
 
 function syncAgent() {
+    // A warning belongs to the model that caused it.
+    if (llm.model !== settings.model) $('ollama-warning').classList.add('hidden');
     decider.ruleNotes = llm.ruleNotes = ruleNotes();
     Object.assign(decider, {
         baseUrl: settings.baseUrl, model: settings.decisionModel, digestState: settings.digestState,

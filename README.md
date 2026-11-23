@@ -227,9 +227,37 @@ Each decision is one stateless call to `POST /api/chat`:
 - `format`: a JSON schema (Ollama's structured outputs) that restricts `action` to the four
   legal values, with an optional `reasoning` string first. The answer is therefore always
   parseable. Anything odd is still counted as "invalid output" and treated as `STAY`.
+  If a model rejects structured outputs, the game shows a **warning** (not an error), retries
+  without `format`, and keeps playing with prompt-only JSON. The action is then picked out of
+  the text, so invalid outputs become more likely.
 - `think: false` (checkbox) turns off long thinking for reasoning models such as qwen3. If
   the server or model doesn't support the flag, the game retries once without it.
 - `keep_alive: 30m` keeps the model loaded between turns.
+
+## Strategy: act early
+
+Real-time crashes with a slow model are mostly "too slow": the answer about an asteroid
+one row away arrives after it has hit. The default prompts and option descriptions therefore
+tell the model to act **early**: shoot ice and stone as soon as they're in the lane, however
+far away, and move away from metal as soon as it appears. The digested state includes
+`shots_needed` (hits left minus lasers already on their way), so the model doesn't over-shoot
+or have to do the subtraction.
+
+A simulation of a pilot that follows each strategy literally (40 seeds, answers applied
+*k* ticks late) shows how much this matters:
+
+| Answer arrives… | "Deal with it when it's close" | "Act early" |
+| --- | --- | --- |
+| on time | 286 ticks (median) | 372 |
+| 1 tick late | 49 | 106 |
+| 2 ticks late | 29 | 84 |
+
+Two further ideas the simulation supports, not built in (yet):
+
+- **Latency margin**: treat a lane as blocked if anything arrives within 1 + *k* turns, where *k*
+  is the expected delay. That gives another 20–30%.
+- **Prediction**: send the state projected *k* ticks ahead, i.e. as it will be when the
+  answer arrives. Both need the game to estimate the model's latency.
 
 ## Choosing models
 
