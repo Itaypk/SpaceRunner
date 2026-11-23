@@ -6,7 +6,7 @@
  */
 
 class HeuristicBot {
-    constructor(depth = 5) {
+    constructor(depth = 6) {
         this.depth = depth;
         this.name = 'Heuristic bot';
         // The bot's rulebook is frozen in code, written before any rule change existed.
@@ -15,7 +15,7 @@ class HeuristicBot {
         this.knownTypes = ['ice', 'stone', 'metal'];
     }
 
-    /** Try every action sequence `depth` ticks ahead (4^5 = 1024 cheap simulations). */
+    /** Try every action sequence `depth` ticks ahead (4^6 = 4096 cheap simulations, ~1-2 ms). */
     decide(world) {
         const sim = world.clone();
         sim.rules = {};
