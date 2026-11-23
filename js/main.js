@@ -54,6 +54,8 @@ let runId = 0;
 let inflight = null;           // pending LLM request: { promise, forTick }
 let stats;
 const ui = { thinkingSince: 0, lastAction: null, lastActionAt: 0, lastConfidence: null };
+let lastTickAt = 0;
+let tickIntervalAvg = 0;   // smoothed time between ticks, for the on-screen animation length
 let runs = readStorage('spacerunner.runs', []);
 
 /** Something changed (key, pause, step...): wake up whoever waits. */
@@ -85,6 +87,8 @@ function startGame(seed = settings.seed) {
     interruptAll();
     world = new World(seed, activeRules);
     renderer.reset();
+    lastTickAt = 0;
+    tickIntervalAvg = 0;
     resetStats();
     pendingKey = null;
     phase = 'playing';
@@ -128,7 +132,7 @@ async function loop(id) {
         const decision = await decide(id, single, started + settings.tickMs);
         if (id !== runId) return;
         if (!decision) continue; // interrupted: re-evaluate pause/controller
-        applyTick(decision);
+        applyTick(decision, single);
         if (world.status !== 'playing') break;
         const keyboardTurn = settings.controller === 'keyboard' && settings.pacing === 'turn';
         if (!single && !keyboardTurn) await sleep(settings.tickMs - (performance.now() - started));
@@ -212,9 +216,25 @@ function ollamaFailed(message, actor = 'Ollama') {
     refreshUi();
 }
 
-function applyTick(decision) {
+/**
+ * How long the movement of one tick should take on screen: the time until the next tick
+ * is expected, so motion is continuous instead of hopping from tile to tile.
+ */
+function animationMs(single) {
+    const now = performance.now();
+    const interval = lastTickAt ? now - lastTickAt : settings.tickMs;
+    lastTickAt = now;
+    if (single) return 250;                                   // stepping: a short, visible move
+    if (settings.pacing === 'realtime') return settings.tickMs; // fixed cadence
+    if (settings.controller === 'keyboard') return 200;        // turn-based keys: as fast as you press
+    // Turn-based with a bot/model: ticks come as fast as decisions do, so follow their pace.
+    tickIntervalAvg = tickIntervalAvg ? tickIntervalAvg * 0.7 + Math.min(interval, 3000) * 0.3 : interval;
+    return Math.min(1500, Math.max(settings.tickMs, tickIntervalAvg));
+}
+
+function applyTick(decision, single = false) {
     world.step(decision.action);
-    renderer.onTick(world);
+    renderer.onTick(world, animationMs(single));
     ui.lastAction = decision.action;
     ui.lastActionAt = performance.now();
     ui.lastConfidence = decision.fromModel && decision.probabilities ? decision.probabilities[decision.action] : null;

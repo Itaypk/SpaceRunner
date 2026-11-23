@@ -260,11 +260,15 @@ with exact rules), but plan for it.
 
 ## Game rules (exact)
 
-- 4 lanes × 16 rows. The ship sits on row 14, and asteroids fall 1 row per tick.
+- 4 lanes × 16 rows, and asteroids fall 1 row per tick. The ship is two rows tall: its nose
+  is in row 13, its body in row 14. An asteroid hits as soon as it reaches the nose row, which
+  is where the sprites visibly touch. One beside either half still blocks a lane change.
+- `rows_away` counts turns until an asteroid reaches the nose row. It's 0 for an asteroid
+  beside the ship.
 - Asteroids: **ice** takes 1 hit, **stone** takes 2, **metal** can't be destroyed.
 - Lasers travel 4 rows per tick, checked one row at a time, so nothing gets skipped.
 - Order of one tick: apply the action → sideways collision → asteroids fall → lasers fly and
-  hit → collision in the ship's row → a new asteroid may spawn.
+  hit → collision with the ship → a new asteroid may spawn.
 - With the rule change on, explosive asteroids also can't be destroyed, and shooting one destroys the ship.
 - Lasers fade out before the top row, so they only hit asteroids that were already visible
   when the shot was decided.
@@ -272,6 +276,14 @@ with exact rules), but plan for it.
   explosive if the rule is on). The generator checks that a dodge-only path survives, and
   turns the offending asteroid into a normal one if not.
 - Score = ticks survived.
+
+## Rendering
+
+The logic runs in discrete ticks, but the drawing doesn't hop from tile to tile. Each tick
+animates every object from where it is drawn to its new position over the time until the
+next tick is expected (the tick length in real-time mode, the measured decision pace in
+turn-based mode). A laser hit plays out where the laser and the asteroid visually meet, and
+on a crash the scene freezes at the moment of contact while the ship breaks apart.
 
 ## Project structure
 

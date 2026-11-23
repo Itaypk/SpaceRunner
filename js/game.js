@@ -10,7 +10,9 @@
 
 const LANES = 4;
 const ROWS = 16;              // visible rows 0..15, spawn row is -1 (off-screen)
-const PLAYER_ROW = 14;
+// The ship is two rows tall: its nose is in PLAYER_ROW, its body in PLAYER_ROW + 1. An asteroid
+// hits the ship as soon as it reaches the nose row, which is where the sprites visibly touch.
+const PLAYER_ROW = 13;
 const LASER_SPEED = 4;        // rows per tick
 const START_LANE = 1;
 const ACTIONS = ['LEFT', 'RIGHT', 'SHOOT', 'STAY'];
@@ -87,7 +89,11 @@ class Track {
             const explosiveCandidate = type !== 'metal' && variantRoll < 0.2 && this.blockerIsFair(tick, lane);
             spawn = { lane, type, variant: variantRoll, explosiveCandidate };
             this.lastSpawnTick[lane] = tick;
-            if (type === 'metal' || explosiveCandidate) this.blockedSet(tick + Track.TICKS_TO_PLAYER).add(lane);
+            if (type === 'metal' || explosiveCandidate) {
+                // It occupies the ship's two rows on two consecutive ticks.
+                this.blockedSet(tick + Track.TICKS_TO_PLAYER).add(lane);
+                this.blockedSet(tick + Track.TICKS_TO_PLAYER + 1).add(lane);
+            }
         }
         this.spawns.push(spawn);
     }
@@ -100,15 +106,16 @@ class Track {
     /** Would an undestroyable asteroid spawned now in `lane` still leave a survivable path? */
     blockerIsFair(tick, lane) {
         const arrival = tick + Track.TICKS_TO_PLAYER;
-        // Everything up to arrival - 1 is already final (later spawns arrive later), so
-        // only the arrival tick needs checking against the cached reachable lanes.
+        // Everything up to arrival - 1 is already final (later spawns arrive later), so only
+        // the two ticks the new asteroid occupies need checking against the cached lanes.
         const known = (t, l) => this.blockedSet(t).has(l);
         while (this.reachable.length < arrival) {
             const t = this.reachable.length;
             this.reachable.push(Track.advance(this.reachable[t - 1], t, known));
         }
-        const withNew = (t, l) => known(t, l) || (t === arrival && l === lane);
-        return Track.advance(this.reachable[arrival - 1], arrival, withNew).size > 0;
+        const withNew = (t, l) => known(t, l) || ((t === arrival || t === arrival + 1) && l === lane);
+        const atArrival = Track.advance(this.reachable[arrival - 1], arrival, withNew);
+        return atArrival.size > 0 && Track.advance(atArrival, arrival + 1, withNew).size > 0;
     }
 
     /** Lanes the player can occupy at the end of tick t, given the lanes at t-1. */
@@ -126,7 +133,8 @@ class Track {
         return next;
     }
 }
-// An asteroid spawned at row -1 at the end of tick t is at PLAYER_ROW at the end of tick t + 15.
+// An asteroid spawned at row -1 at the end of tick t is at PLAYER_ROW at the end of tick t + 14
+// (and at PLAYER_ROW + 1, beside the ship's body, at t + 15).
 Track.TICKS_TO_PLAYER = PLAYER_ROW + 1;
 
 class World {
@@ -242,7 +250,7 @@ class World {
     }
 
     checkCrash() {
-        const hit = this.asteroids.find(a => a.lane === this.playerLane && a.row === PLAYER_ROW);
+        const hit = this.asteroids.find(a => a.lane === this.playerLane && (a.row === PLAYER_ROW || a.row === PLAYER_ROW + 1));
         if (!hit) return false;
         this.status = 'crashed';
         this.events.push({ kind: 'crash', id: hit.id, type: hit.type, lane: this.playerLane });
@@ -257,11 +265,12 @@ class World {
         const lanes = [];
         for (let lane = 0; lane < LANES; lane++) {
             const asteroids = this.asteroids
-                .filter(a => a.lane === lane && a.row >= 0 && a.row <= PLAYER_ROW)
+                // Rows up to the ship's body: an asteroid beside the ship still blocks a lane change.
+                .filter(a => a.lane === lane && a.row >= 0 && a.row <= PLAYER_ROW + 1)
                 .sort((a, b) => b.row - a.row)
                 .slice(0, 3)
                 .map(a => {
-                    const o = { type: a.type, rows_away: PLAYER_ROW - a.row };
+                    const o = { type: a.type, rows_away: Math.max(0, PLAYER_ROW - a.row) }; // 0 = beside the ship
                     if (a.type === 'ice' || a.type === 'stone') o.hits_left = a.hp;
                     return o;
                 });
