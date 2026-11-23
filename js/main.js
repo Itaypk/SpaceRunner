@@ -20,9 +20,16 @@ const DEFAULT_SETTINGS = {
     withReasoning: true, disableThinking: true, systemPrompt: DEFAULT_SYSTEM_PROMPT,
     decisionModel: 'nimble', digestState: true, askDanger: false,
     decisionInstructions: DEFAULT_DECISION_INSTRUCTIONS.digested,
-    ruleExplosive: false,
+    ruleExplosive: false, dropLate: false,
 };
 const settings = { ...DEFAULT_SETTINGS, ...readStorage('spacerunner.settings', {}) };
+// Saved copies of an earlier *default* prompt get the current default; edited prompts are kept.
+if (LEGACY_DEFAULT_HASHES.systemPrompt.includes(promptHash(settings.systemPrompt))) {
+    settings.systemPrompt = DEFAULT_SYSTEM_PROMPT;
+}
+if (LEGACY_DEFAULT_HASHES.decisionInstructions.includes(promptHash(settings.decisionInstructions))) {
+    settings.decisionInstructions = DEFAULT_DECISION_INSTRUCTIONS[settings.digestState ? 'digested' : 'raw'];
+}
 function readStorage(key, fallback) {
     try { return JSON.parse(localStorage.getItem(key)) || fallback; } catch (_) { return fallback; }
 }
@@ -55,6 +62,7 @@ let inflight = null;           // pending LLM request: { promise, forTick }
 let stats;
 const ui = { thinkingSince: 0, lastAction: null, lastActionAt: 0, lastConfidence: null };
 let lastTickAt = 0;
+let lastPostMortem = null;  // { kind, text } explaining the last crash
 let tickIntervalAvg = 0;   // smoothed time between ticks, for the on-screen animation length
 let runs = readStorage('spacerunner.runs', []);
 
@@ -107,7 +115,7 @@ function gameOver() {
     const avg = average(stats.latencies);
     runs.unshift({
         pilot: pilotLabel(), pacing: settings.pacing, seed: world.seed, score: world.score,
-        rules: activeRules.explosive ? 'explosive' : '',
+        rules: activeRules.explosive ? 'explosive' : '', crashKind: lastPostMortem ? lastPostMortem.kind : '',
         destroyed: world.destroyed, avgMs: avg ? Math.round(avg) : null, missed: stats.missed,
     });
     runs = runs.slice(0, 30);
@@ -117,6 +125,7 @@ function gameOver() {
         if (phase !== 'over') return;
         $('overlay-title').textContent = 'Crashed';
         $('overlay-subtitle').textContent = `${cause} · score ${world.score} · ${world.destroyed} destroyed`;
+        $('overlay-why').textContent = lastPostMortem ? `${lastPostMortem.kind}: ${lastPostMortem.text}` : '';
         $('btn-start').textContent = 'Retry same field';
         $('overlay').classList.remove('hidden');
     }, 1700); // let the destruction animation play first
@@ -153,12 +162,14 @@ async function decide(id, single, deadline) {
             }
             const action = pendingKey || 'STAY';
             pendingKey = null;
-            showObservation(world.observe(), 'Current state');
-            return { action, actor: 'You' };
+            const seen = world.observe();
+            showObservation(seen, 'Current state');
+            return { action, actor: 'You', seen };
         }
         case 'bot': {
-            showObservation(world.observe(), 'Current state');
-            return { ...bot.decide(world), actor: 'Bot' };
+            const seen = world.observe();
+            showObservation(seen, 'Current state');
+            return { ...bot.decide(world), actor: 'Bot', seen };
         }
         case 'decision':
         case 'ollama': {
@@ -183,7 +194,14 @@ async function decide(id, single, deadline) {
                 if (result.error.name !== 'AbortError') ollamaFailed(result.error.message, pilot.actor);
                 return null;
             }
-            return { ...result, actor: pilot.actor, fromModel: true, stale: world.tick - result.forTick };
+            const stale = world.tick - result.forTick;
+            if (stale > 0 && settings.dropLate) {
+                // Real-time trade-off: acting on an outdated state can be worse than not acting.
+                stats.missed++;
+                return { ...result, actor: `${pilot.actor} (late, dropped)`, fromModel: true, stale,
+                    dropped: result.action, action: 'STAY', missed: true };
+            }
+            return { ...result, actor: pilot.actor, fromModel: true, stale };
         }
     }
 }
@@ -193,9 +211,9 @@ function startThinking(pilot) {
     const forTick = world.tick;
     showObservation(pilot.agent.stateFor(obs), `Sent to model · turn ${forTick}`);
     ui.thinkingSince = performance.now();
-    const entry = { forTick };
+    const entry = { forTick, obs };
     entry.promise = pilot.agent.decide(obs)
-        .then(r => ({ ...r, forTick }), error => ({ error }))
+        .then(r => ({ ...r, forTick, seen: obs }), error => ({ error }))
         .finally(() => { if (inflight === entry || !inflight) ui.thinkingSince = 0; });
     return entry;
 }
@@ -233,11 +251,14 @@ function animationMs(single) {
 }
 
 function applyTick(decision, single = false) {
+    const before = world.observe();
     world.step(decision.action);
     renderer.onTick(world, animationMs(single));
     ui.lastAction = decision.action;
     ui.lastActionAt = performance.now();
-    ui.lastConfidence = decision.fromModel && decision.probabilities ? decision.probabilities[decision.action] : null;
+    ui.lastConfidence = decision.fromModel && decision.probabilities && !decision.dropped
+        ? decision.probabilities[decision.action] : null;
+    lastPostMortem = world.status === 'crashed' ? explainCrash(decision, before, world) : null;
 
     if (decision.fromModel) {
         stats.decisions++;
@@ -252,12 +273,14 @@ function applyTick(decision, single = false) {
     if (decision.latencyMs) detail += ` · ${decision.latencyMs}ms`;
     if (decision.loadMs > 500) detail += ` (model load ${(decision.loadMs / 1000).toFixed(1)}s)`;
     if (decision.stale) detail += ` · ${decision.stale} tick${decision.stale > 1 ? 's' : ''} late`;
+    if (decision.dropped) detail += ` · ${decision.dropped} dropped`;
     if (decision.valid === false) detail += ' · invalid output';
     if (ui.lastConfidence != null) detail += ` · p=${ui.lastConfidence.toFixed(2)}`;
     const quietTick = decision.actor === 'You' && decision.action === 'STAY';
     if (!quietTick) log(decision.actor, `${decision.action}${detail}`, decision.missed ? 'warn' : decision.fromModel ? 'llm' : '',
         decision.fromModel || /doesn't know/.test(decision.reasoning || '') ? decision.reasoning : '');
     if (world.events.some(e => e.kind === 'destroy')) log('', 'asteroid destroyed', 'dim');
+    if (lastPostMortem) log('Post-mortem', `${lastPostMortem.kind}: ${lastPostMortem.text}`, 'err');
     refreshUi();
 }
 
@@ -446,7 +469,7 @@ function renderRuns() {
     for (const r of runs) {
         const tr = document.createElement('tr');
         for (const v of [r.pilot, r.pacing === 'turn' ? 'turn' : 'real-time', r.rules || '–', r.seed, r.score, r.destroyed,
-            r.avgMs === null ? '–' : `${r.avgMs}`, r.missed]) {
+            r.avgMs === null ? '–' : `${r.avgMs}`, r.missed, r.crashKind || '–']) {
             const td = document.createElement('td');
             td.textContent = v;
             tr.appendChild(td);
@@ -576,6 +599,7 @@ function init(sprites) {
     bindSettingInput('tick-ms', 'tickMs', Number, refreshUi);
     bindSettingInput('seed', 'seed', v => Math.max(0, parseInt(v, 10) || 0));
     bindSettingInput('show-overlay', 'showOverlay');
+    bindSettingInput('drop-late', 'dropLate');
     bindSettingInput('base-url', 'baseUrl', String, syncAgent);
     bindSettingInput('model', 'model', v => v.trim(), syncAgent);
     bindSettingInput('temperature', 'temperature', Number, () => { $('temperature-label').textContent = settings.temperature.toFixed(1); syncAgent(); });

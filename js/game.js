@@ -282,3 +282,55 @@ class World {
         return { turn: this.tick, player_lane: this.playerLane, lanes };
     }
 }
+
+/**
+ * Explain a crash in one sentence and classify it: a wrong decision (the state the pilot
+ * saw already showed the danger), outdated information (it acted on a state that had
+ * moved on), or too slow (no decision in time).
+ *
+ * decision: { action, seen, stale, missed, dropped } where `seen` is the observation the
+ *           decision was based on; before: the observation right before the fatal tick.
+ */
+function explainCrash(decision, before, world) {
+    const crash = world.events.find(e => e.kind === 'crash');
+    if (!crash) return null;
+    if (crash.cause === 'detonated') return { kind: 'wrong decision', text: 'shot an explosive asteroid' };
+    const where = a => `${a.type} ${a.rows_away === 0 ? 'beside the ship' : `${a.rows_away} row${a.rows_away > 1 ? 's' : ''} away`}`;
+    const danger = (obs, lane) => ((obs.lanes[lane] || {}).asteroids || []).find(a => a.rows_away <= 1);
+    const seen = decision.seen || before;
+    const age = decision.stale ? `${decision.stale} tick${decision.stale > 1 ? 's' : ''} old` : '';
+    const { action } = decision;
+
+    if (action === 'LEFT' || action === 'RIGHT') {
+        const step = action === 'LEFT' ? -1 : 1;
+        const seenTarget = seen.player_lane + step;
+        const seenDanger = danger(seen, seenTarget);
+        if (seenDanger) {
+            return { kind: 'wrong decision', text: `moved ${action} into lane ${seenTarget}, although the state it saw showed ${where(seenDanger)} there` };
+        }
+        const target = before.player_lane + step;
+        const nowDanger = danger(before, target);
+        if (age) {
+            return { kind: 'outdated information', text: `moved ${action} based on a state ${age}: lane ${target} looked safe then, ` +
+                `but by the time it acted there was ${nowDanger ? where(nowDanger) : 'an asteroid'}` };
+        }
+        return { kind: 'wrong decision', text: `moved ${action} into lane ${target}` };
+    }
+
+    // Stayed or shot: something came down the ship's own lane.
+    const own = danger(before, before.player_lane) || { type: crash.type, rows_away: 1 };
+    if (decision.dropped) {
+        const late = `${decision.stale} tick${decision.stale > 1 ? 's' : ''}`;
+        return { kind: 'too slow', text: `its answer (${decision.dropped}) came ${late} late and was dropped; meanwhile ${where(own)}` };
+    }
+    if (decision.missed) return { kind: 'too slow', text: `no decision in time: ${where(own)} while the model was still thinking` };
+    if (action === 'SHOOT' && own.type === 'stone' && own.hits_left > 1) {
+        return { kind: 'wrong decision', text: 'shot too late: the stone needed 2 hits' };
+    }
+    if (action === 'SHOOT' && own.type !== 'ice' && own.type !== 'stone') {
+        return { kind: 'wrong decision', text: `shot at ${own.type}, which can't be destroyed: it had to be dodged` };
+    }
+    const verb = action === 'SHOOT' ? 'shot' : 'stayed';
+    if (age) return { kind: 'outdated information', text: `${verb} based on a state ${age}; by then there was ${where(own)}` };
+    return { kind: 'wrong decision', text: `${verb} with ${where(own)} in its own lane` };
+}

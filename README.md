@@ -104,10 +104,30 @@ These are the main thing the demo shows.
   is applied on a later tick, so it acts on a state that's already out of date. The log
   marks these as `1 tick late`, and the stats count `ticks w/o decision`. This shows
   latency as part of decision quality.
+
+  **Drop late answers** (checkbox) discards an answer that arrives after its tick: the ship
+  stays instead of acting on an outdated state. Neither choice is free. Applying late answers
+  causes crashes like "moved right because it was safe two ticks ago". Dropping them means a
+  slow model barely acts at all.
 - **Turn-based**: the world waits for every decision, so only reasoning quality matters. With
   the keyboard pilot, each key press is one turn.
 - **Pause + Step**: freeze the world and advance one decision at a time. Each step sends one
   request, so you can talk through the state JSON, the reasoning, and the outcome.
+
+### Why did it crash?
+
+Every crash gets a one-line post-mortem in the log, on the game-over screen and in the
+**Runs** table. It's one of three kinds:
+
+- **wrong decision**: the state the pilot saw already showed the danger, e.g. "moved RIGHT
+  into lane 2, although the state it saw showed metal 1 row away there".
+- **outdated information**: the pilot decided on a state that had moved on by the time the
+  action was applied (real-time mode, slow model).
+- **too slow**: there was no decision in time, or a late answer was dropped.
+
+That separates "the model got it wrong" from "the model was right too late", which are
+different problems with different fixes: better context or a better model, versus a
+faster model or turn-based play.
 
 ### Rule change: explosive asteroids
 
@@ -174,7 +194,7 @@ Options in the **Decision** section:
   ```json
   {"turn": 42,
    "current_lane": {"exists": true, "threat": "must_dodge", "nearest": "metal", "turns_to_impact": 3},
-   "left_lane":    {"exists": true, "safe_to_enter": false, "threat": "shootable", "nearest": "ice", "turns_to_impact": 1, "hits_left": 1},
+   "left_lane":    {"exists": true, "safe_to_enter": false, "blocked_by": "ice arriving next turn", "threat": "shootable", "nearest": "ice", "turns_to_impact": 1, "hits_left": 1},
    "right_lane":   {"exists": true, "safe_to_enter": true, "threat": "none"}}
   ```
 
@@ -185,6 +205,9 @@ Options in the **Decision** section:
   are scored separately, so it shows how latency grows with each extra question.
 - **Question instructions** are editable live, with a reset to default. The defaults switch
   along with the state format unless you've edited them.
+  Prompts are saved in the browser. A saved copy of an *earlier default* is upgraded
+  automatically when the defaults improve. A prompt you've edited is left alone (use
+  **Reset to default** to get the new one).
 
 ## How the LLM is called
 
