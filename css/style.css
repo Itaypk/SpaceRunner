@@ -61,6 +61,8 @@ body {
 .overlay h1 { margin: 0; font-size: 46px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; }
 .overlay p { margin: 0 0 14px; color: var(--muted); }
 .overlay .keys-hint { margin-top: 10px; font-size: 12px; }
+.overlay .why { max-width: 80%; text-align: center; color: #fca5a5; font-size: 13px; }
+.overlay .why:empty { display: none; }
 
 .help { color: var(--muted); font-size: 12px; text-align: center; }
 kbd {

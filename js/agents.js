@@ -71,12 +71,18 @@ THE WORLD
   - metal: indestructible. You MUST dodge it.
 
 ACTIONS
-- LEFT / RIGHT: move one lane immediately. Moving into a lane where an asteroid has rows_away 0 or 1 is a crash.
+- LEFT / RIGHT: move one lane immediately. Moving into a lane where an asteroid has rows_away 0 (beside you)
+  or 1 is a crash, even if your own lane is clear.
 - SHOOT: fire a laser up your current lane. It travels 4 rows per turn and damages the first asteroid it meets.
   A laser fired when an asteroid is at rows_away 1 still hits it before it reaches you.
 - STAY: do nothing this turn.
 
 Each turn you receive the current state as JSON: per lane, the nearest asteroids (closest first) and any lasers already in flight.
+
+STRATEGY
+- Only change lanes when your own lane is threatened by something you can't shoot in time.
+  Every move into another lane is a risk.
+- Before choosing LEFT or RIGHT, check the target lane: any asteroid there with rows_away 0 or 1 means a crash.
 
 Survive as long as possible. Destroying asteroids is a bonus, surviving is what counts.`;
 
@@ -85,11 +91,12 @@ const DEFAULT_DECISION_INSTRUCTIONS = {
     raw: `The state describes a spaceship in a 4-lane asteroid field, seen from above. Lanes are numbered 0 (far left) to 3 (far right); the ship is in \`player_lane\`.
 Each entry in \`lanes\` lists that lane's nearest asteroids, closest first. \`rows_away\` is how many turns until the asteroid reaches the ship's row; asteroids move 1 row per turn.
 If an asteroid reaches the ship's row in the ship's lane, the ship is destroyed. Ice needs 1 laser hit, stone needs 2 (\`hits_left\`), metal cannot be destroyed and must be dodged.
-Changing lanes is only safe if the target lane has no asteroid at rows_away 0 or 1.
+Changing lanes is only safe if the target lane has no asteroid at rows_away 0 (beside the ship) or 1, even when the ship's own lane is clear. Only change lanes when the ship's own lane is threatened.
 Which action keeps the ship alive this turn and in the turns after it?`,
     digested: `The state describes a spaceship flying through an asteroid field, seen from above.
 \`current_lane\` is the ship's lane: \`threat\` says what is coming ("none", "shootable" for ice/stone, "must_dodge" for metal, "unknown" for other types; \`nearest\` names the type) and \`turns_to_impact\` says how soon it hits the ship if the ship stays.
-\`left_lane\` and \`right_lane\` describe the neighbouring lanes: \`exists\` is false at the edge of the field, and \`safe_to_enter\` says whether moving there this turn is safe. Their \`threat\` and \`turns_to_impact\` describe what comes next in that lane.
+\`left_lane\` and \`right_lane\` describe the neighbouring lanes: \`exists\` is false at the edge of the field, and \`safe_to_enter\` says whether moving there this turn is safe; if not, \`blocked_by\` says why, and moving there crashes the ship. Their \`threat\` and \`turns_to_impact\` describe what comes next in that lane.
+Only change lanes when the ship's own lane is threatened, and never into a lane that isn't safe to enter.
 A metal asteroid can only be dodged. Ice and stone can be shot, but stone needs 2 hits (\`hits_left\`).
 Which action keeps the ship alive this turn and in the turns after it?`,
 };
@@ -119,13 +126,15 @@ function digestObservation(obs) {
         if (info.lasers_in_flight) out.lasers_in_flight = info.lasers_in_flight;
         return out;
     };
-    const safeToEnter = lane => {
-        const info = obs.lanes[lane];
-        return !!info && !info.asteroids.some(a => a.rows_away <= 1);
-    };
     const side = lane => {
         const d = describe(lane);
-        return d.exists ? { exists: true, safe_to_enter: safeToEnter(lane), ...d } : d;
+        if (!d.exists) return d;
+        // An asteroid beside the ship isn't "ahead", so `threat` can't show it. Say explicitly
+        // why a lane is blocked, so the two signals never look contradictory.
+        const blocking = obs.lanes[lane].asteroids.find(a => a.rows_away <= 1);
+        const out = { exists: true, safe_to_enter: !blocking };
+        if (blocking) out.blocked_by = `${blocking.type} ${blocking.rows_away === 0 ? 'beside the ship' : 'arriving next turn'}`;
+        return { ...out, ...d };
     };
     const lane = obs.player_lane;
     return { turn: obs.turn, current_lane: describe(lane), left_lane: side(lane - 1), right_lane: side(lane + 1) };
@@ -135,11 +144,18 @@ function digestObservation(obs) {
 const DEFAULT_DECISION_CRITERIA = {
     STAY: 'Stay in the current lane and do nothing. Right when nothing in the ship\'s lane is about to arrive.',
     SHOOT: 'Fire a laser up the current lane. Right when the nearest asteroid in the ship\'s lane is ice or stone.',
-    LEFT: 'Move one lane to the left (lane number - 1). Right when the current lane is threatened and the left lane is safe.',
-    RIGHT: 'Move one lane to the right (lane number + 1). Right when the current lane is threatened and the right lane is safe.',
+    LEFT: 'Move one lane to the left (lane number - 1). Only right when the current lane is threatened and the left lane is safe to enter; a crash if anything in the left lane is beside the ship or arrives next turn.',
+    RIGHT: 'Move one lane to the right (lane number + 1). Only right when the current lane is threatened and the right lane is safe to enter; a crash if anything in the right lane is beside the ship or arrives next turn.',
 };
 
 const withNotes = (text, notes) => notes ? `${text}\n\n${notes}` : text;
+
+/** Fingerprints of earlier default prompts, so saved-but-unedited copies get upgraded. */
+const promptHash = s => { let x = 5381; for (let i = 0; i < s.length; i++) x = ((x * 33) ^ s.charCodeAt(i)) >>> 0; return x; };
+const LEGACY_DEFAULT_HASHES = {
+    systemPrompt: [462703211],
+    decisionInstructions: [3465441998, 247429411], // raw, digested
+};
 
 /** Shared plumbing for talking to a local Ollama server. */
 class OllamaClient {
